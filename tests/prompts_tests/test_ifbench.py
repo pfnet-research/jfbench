@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from jfbench.prompts import ifbench as ifbench_module
 from jfbench.prompts import IFBenchPrompt
 
 
@@ -25,6 +28,9 @@ class DummyConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 def test_ifbench_prompt_text_returns_stored_value() -> None:
     prompt = IFBenchPrompt("テストプロンプト")
@@ -39,3 +45,8 @@ def test_ifbench_prompt_uses_test_instructions() -> None:
 
     assert "(test)" in rendered
     assert constraint.last_mode == "test"
+
+
+def test_ifbench_default_data_path_uses_repository_relative_location() -> None:
+    expected_suffix = Path("data/ifbench_ja_translated.jsonl")
+    assert str(ifbench_module.DATA_PATH).endswith(str(expected_suffix))

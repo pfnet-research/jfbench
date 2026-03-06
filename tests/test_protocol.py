@@ -22,6 +22,9 @@ class _DummyConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 def _use_constraint(constraint: Constraint) -> tuple[bool, str]:
     ok = cast("tuple[bool, str | None]", constraint.evaluate("ok"))[0]

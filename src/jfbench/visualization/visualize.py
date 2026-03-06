@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=None,
         help=(
-            "Constraint set names to include (training, test). "
+            "Constraint set names to include (train, test). "
             "Can be provided multiple times or as a comma-separated string."
         ),
     )
@@ -162,8 +162,8 @@ def _normalize_constraint_sets(values: Sequence[str] | None) -> list[str] | None
         for part in parts:
             if not part:
                 continue
-            if part not in {"training", "test"}:
-                raise ValueError("Constraint set must be 'training' or 'test'.")
+            if part not in {"train", "test"}:
+                raise ValueError("Constraint set must be 'train' or 'test'.")
             normalized.append(part)
     return normalized or None
 

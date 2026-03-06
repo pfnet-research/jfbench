@@ -26,8 +26,8 @@ def parse_result_filename(path: Path) -> dict[str, str | int] | None:
     parts = stem.split("-")
     if len(parts) < 3:
         return None
-    constraint_set = "training"
-    if len(parts) >= 4 and parts[1] in {"training", "test"}:
+    constraint_set = "train"
+    if len(parts) >= 4 and parts[1] in {"train", "test"}:
         benchmark = parts[0]
         constraint_set = parts[1]
         n_part = parts[2]

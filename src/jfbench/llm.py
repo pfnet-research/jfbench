@@ -6,14 +6,6 @@ from typing import cast
 from typing import Literal
 from typing import TYPE_CHECKING
 
-from jfbench.imports import LazyImport
-
-
-try:
-    import vllm
-except ImportError:
-    vllm = LazyImport("vllm")
-
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion import Choice as ChatChoice
@@ -27,6 +19,7 @@ if TYPE_CHECKING:
 
 N_PARALLEL_REQUEST = 200
 N_RETRIES_PER_REQUEST = 3
+DEFAULT_OPENROUTER_MODEL = "openai/gpt-oss-120b"
 
 logger = logging.getLogger(__name__)
 
@@ -34,22 +27,26 @@ logger = logging.getLogger(__name__)
 class LLMClient:
     def __init__(
         self,
-        provider: Literal["openrouter", "local", "vllm"] = "openrouter",
+        provider: Literal["openrouter", "vllm"] = "openrouter",
         model: str | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> None:
         body_params = dict(extra_body) if extra_body is not None else {}
-        self.client: AsyncOpenAI | vllm.LLM
+        self.client: AsyncOpenAI
         self.semaphore: asyncio.Semaphore | None = None
-        model_name = model or "openai/gpt-oss-120b"
-        if provider == "local":
-            tensor_parallel_size = body_params.pop("tensor_parallel_size", 1)
-            self.client = vllm.LLM(
-                model=model_name,
-                trust_remote_code=True,
-                tensor_parallel_size=tensor_parallel_size,
-            )
+        self.base_url: str | None = None
+        self.api_key: str | None = None
+        self.timeout: int | None = None
+        model_name: str | None
+        if model is not None:
+            model_name = model
         elif provider == "openrouter":
+            model_name = DEFAULT_OPENROUTER_MODEL
+        else:
+            model_name = os.environ.get("JFBENCH_LOCAL_MODEL")
+        if not model_name:
+            raise ValueError("Model name is required. Set model or JFBENCH_LOCAL_MODEL for vllm.")
+        if provider == "openrouter":
             self.client = AsyncOpenAI(
                 base_url="https://openrouter.ai/api/v1",
                 api_key=os.environ["OPENROUTER_API_KEY"],
@@ -59,21 +56,56 @@ class LLMClient:
             base_url = body_params.pop("base_url", "http://localhost:8000/v1")
             api_key = body_params.pop("api_key", "unsed")
             timeout = body_params.pop("timeout", 600)
+            self.base_url = str(base_url)
+            self.api_key = str(api_key)
+            self.timeout = int(timeout)
             self.client = AsyncOpenAI(
                 base_url=base_url,
                 api_key=api_key,
                 timeout=timeout,
             )
             self.semaphore = asyncio.Semaphore(N_PARALLEL_REQUEST)
-            print(f"Using vLLM endpoint at {base_url} for model {model_name}")
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
         self.provider = provider
         self.model = model_name
-        self.temperature = body_params.pop("temperature", 0.0)
+        self.temperature = body_params.pop("temperature", 0.1)
         self.max_tokens = body_params.pop("max_tokens", 4096)
         self.stop_token_ids = body_params.pop("stop_token_ids", None)
         self.extra_body = body_params
+
+    def to_serializable_dict(self) -> dict[str, Any]:
+        serialized_extra_body = dict(self.extra_body)
+        serialized_extra_body["temperature"] = self.temperature
+        serialized_extra_body["max_tokens"] = self.max_tokens
+        if self.stop_token_ids is not None:
+            serialized_extra_body["stop_token_ids"] = self.stop_token_ids
+        if self.provider == "vllm":
+            serialized_extra_body["base_url"] = self.base_url or "http://localhost:8000/v1"
+            serialized_extra_body["api_key"] = self.api_key or "unsed"
+            serialized_extra_body["timeout"] = self.timeout or 600
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "extra_body": serialized_extra_body,
+        }
+
+    @classmethod
+    def from_serializable_dict(cls, payload: dict[str, Any]) -> "LLMClient":
+        provider = payload.get("provider")
+        if provider not in {"openrouter", "vllm"}:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
+        model = payload.get("model")
+        if not isinstance(model, str):
+            raise TypeError("LLM client payload model must be a string.")
+        extra_body = payload.get("extra_body", {})
+        if not isinstance(extra_body, dict):
+            raise TypeError("LLM client payload extra_body must be a dict.")
+        return cls(
+            provider=cast('Literal["openrouter", "vllm"]', provider),
+            model=model,
+            extra_body=dict(extra_body),
+        )
 
     async def async_ask(
         self,
@@ -83,10 +115,7 @@ class LLMClient:
     ) -> tuple[list[str], list[Any]]:
         if self.provider == "openrouter" or self.provider == "vllm":
             return await self._ask_openai(prompts, use_tqdm=use_tqdm)
-        if self.provider == "local":
-            return await asyncio.to_thread(self._ask_local, prompts, use_tqdm=use_tqdm)
-        else:
-            raise ValueError(f"Unsupported LLM provider for async_ask: {self.provider}")
+        raise ValueError(f"Unsupported LLM provider for async_ask: {self.provider}")
 
     def ask(
         self,
@@ -94,35 +123,9 @@ class LLMClient:
         *,
         use_tqdm: bool = False,
     ) -> tuple[list[str], list[Any]]:
-        if self.provider == "local":
-            return self._ask_local(prompts, use_tqdm=use_tqdm)
         if self.provider == "openrouter" or self.provider == "vllm":
             return asyncio.run(self._ask_openai(prompts, use_tqdm=use_tqdm))
-        else:
-            raise ValueError(f"Unsupported LLM provider for ask: {self.provider}")
-
-    def _ask_local(self, prompts: list[str], use_tqdm: bool) -> tuple[list[str], list[Any]]:
-        assert self.stop_token_ids is not None
-        sampling = vllm.SamplingParams(
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            stop_token_ids=self.stop_token_ids,
-            **self.extra_body,
-        )
-        messages = [[{"role": "user", "content": prompt}] for prompt in prompts]
-        responses = list(
-            self.client.chat(
-                messages=messages,
-                sampling_params=sampling,
-                use_tqdm=use_tqdm,
-            )
-        )
-        results: list[str] = []
-        for i, r in enumerate(responses):
-            results.append(r.outputs[0].text)
-            if not r.finished:
-                logger.warning(f"Generation for prompt {i} was not finished: {r.prompt}")
-        return results, responses
+        raise ValueError(f"Unsupported LLM provider for ask: {self.provider}")
 
     async def _ask_openai(
         self,

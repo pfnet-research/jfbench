@@ -1,9 +1,11 @@
+from pathlib import Path
+
 import pandas as pd
 
 from jfbench.protocol import Constraint
 
 
-DATA_PATH = "data/ifbench_ja_translated.jsonl"
+DATA_PATH = Path(__file__).resolve().parents[3] / "data" / "ifbench_ja_translated.jsonl"
 JA_PROMPT_COL = "japanese_prompt_without_constraints"
 
 

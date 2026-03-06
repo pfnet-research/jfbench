@@ -1,3 +1,4 @@
+from typing import Any
 from typing import Awaitable
 from typing import Protocol
 from typing import TypeAlias
@@ -18,6 +19,8 @@ class Constraint(Protocol):
 
     @property
     def competitives(self) -> list[str]: ...
+
+    def to_serializable_kwargs(self) -> dict[str, Any]: ...
 
 
 class Prompt(Protocol):

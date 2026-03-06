@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -6,6 +7,8 @@ import hashlib
 import inspect
 import logging
 from typing import Any
+from typing import Awaitable
+from typing import cast
 from typing import Literal
 
 import numpy as np
@@ -194,36 +197,79 @@ def _stable_seed(*parts: str) -> int:
     return int.from_bytes(digest[:8], "little")
 
 
-RuleConstraintFactory = Callable[..., Constraint]
-LLMConstraintFactory = Callable[..., Constraint]
-ConstraintSetName = Literal["training", "test"]
+@dataclass(frozen=True, eq=False)
+class RuleConstraintFactory:
+    constructor: Callable[..., Constraint]
+    uses_document: bool
+    kwargs: dict[str, Any]
+    accepts_seed: bool
+    accepts_document: bool
+
+    def __call__(
+        self,
+        *,
+        seed: int | None = None,
+        document: str | None = None,
+    ) -> Constraint:
+        params = dict(self.kwargs)
+        if self.uses_document and self.accepts_document:
+            params["document"] = document if document is not None else ""
+        if self.accepts_seed:
+            params["seed"] = seed
+        return self.constructor(**params)
+
+
+@dataclass(frozen=True, eq=False)
+class LLMConstraintFactory:
+    constructor: Callable[..., Constraint]
+    uses_document: bool
+    kwargs: dict[str, Any]
+    accepts_seed: bool
+    accepts_document: bool
+
+    def __call__(
+        self,
+        client: LLMClient,
+        document: str,
+        seed: int | None = None,
+    ) -> Constraint:
+        params = dict(self.kwargs)
+        if self.uses_document and self.accepts_document:
+            params["document"] = document
+        if self.accepts_seed:
+            params["seed"] = seed
+        return self.constructor(client=client, **params)
+
+
+ConstraintFactory = Callable[..., Constraint]
+ConstraintSetName = Literal["train", "test"]
 InstructionMode = Literal["train", "test"]
 
 
 @dataclass(frozen=True)
 class ConstraintCollections:
-    character: list[RuleConstraintFactory]
-    rule_content: list[RuleConstraintFactory]
-    llm_content: list[LLMConstraintFactory]
-    format: list[RuleConstraintFactory]
-    length: list[RuleConstraintFactory]
-    logic: list[RuleConstraintFactory]
-    meta_output: list[LLMConstraintFactory]
-    notation: list[RuleConstraintFactory]
-    rule_processing: list[RuleConstraintFactory]
-    llm_processing: list[LLMConstraintFactory]
-    structure: list[LLMConstraintFactory]
-    rule_style: list[RuleConstraintFactory]
-    llm_style: list[LLMConstraintFactory]
-    ifbench_count: list[RuleConstraintFactory]
-    ifbench_format: list[RuleConstraintFactory]
-    ifbench_ratio: list[RuleConstraintFactory]
-    ifbench_repeat: list[RuleConstraintFactory]
-    ifbench_sentence: list[RuleConstraintFactory]
-    ifbench_words: list[RuleConstraintFactory]
+    character: list[ConstraintFactory]
+    rule_content: list[ConstraintFactory]
+    llm_content: list[ConstraintFactory]
+    format: list[ConstraintFactory]
+    length: list[ConstraintFactory]
+    logic: list[ConstraintFactory]
+    meta_output: list[ConstraintFactory]
+    notation: list[ConstraintFactory]
+    rule_processing: list[ConstraintFactory]
+    llm_processing: list[ConstraintFactory]
+    structure: list[ConstraintFactory]
+    rule_style: list[ConstraintFactory]
+    llm_style: list[ConstraintFactory]
+    ifbench_count: list[ConstraintFactory]
+    ifbench_format: list[ConstraintFactory]
+    ifbench_ratio: list[ConstraintFactory]
+    ifbench_repeat: list[ConstraintFactory]
+    ifbench_sentence: list[ConstraintFactory]
+    ifbench_words: list[ConstraintFactory]
 
     @property
-    def rule_based(self) -> list[RuleConstraintFactory]:
+    def rule_based(self) -> list[ConstraintFactory]:
         return (
             self.character
             + self.rule_content
@@ -242,7 +288,7 @@ class ConstraintCollections:
         )
 
     @property
-    def llm_based(self) -> list[LLMConstraintFactory]:
+    def llm_based(self) -> list[ConstraintFactory]:
         return (
             self.llm_content
             + self.meta_output
@@ -263,18 +309,13 @@ def _rule_constraint_factory(
     **kwargs: Any,
 ) -> RuleConstraintFactory:
     signature = inspect.signature(constructor)
-    accepts_seed = "seed" in signature.parameters
-    accepts_document = "document" in signature.parameters
-
-    def factory(*, seed: int | None = None, document: str | None = None) -> Constraint:
-        params = dict(kwargs)
-        if uses_document and accepts_document:
-            params["document"] = document if document is not None else ""
-        if accepts_seed:
-            params["seed"] = seed
-        return constructor(**params)
-
-    return factory
+    return RuleConstraintFactory(
+        constructor=constructor,
+        uses_document=uses_document,
+        kwargs=dict(kwargs),
+        accepts_seed="seed" in signature.parameters,
+        accepts_document="document" in signature.parameters,
+    )
 
 
 def _llm_constraint_factory(
@@ -284,25 +325,16 @@ def _llm_constraint_factory(
     **kwargs: Any,
 ) -> LLMConstraintFactory:
     signature = inspect.signature(constructor)
-    accepts_seed = "seed" in signature.parameters
-    accepts_document = "document" in signature.parameters
-
-    def factory(
-        client: LLMClient,
-        document: str,
-        seed: int | None = None,
-    ) -> Constraint:
-        params = dict(kwargs)
-        if uses_document and accepts_document:
-            params["document"] = document
-        if accepts_seed:
-            params["seed"] = seed
-        return constructor(client=client, **params)
-
-    return factory
+    return LLMConstraintFactory(
+        constructor=constructor,
+        uses_document=uses_document,
+        kwargs=dict(kwargs),
+        accepts_seed="seed" in signature.parameters,
+        accepts_document="document" in signature.parameters,
+    )
 
 
-TRAINING_CHARACTER_CONSTRAINTS: list[RuleConstraintFactory] = [
+TRAINING_CHARACTER_CONSTRAINTS: list[ConstraintFactory] = [
     _rule_constraint_factory(JapanesePunctuationConstraint),
     _rule_constraint_factory(NoCommasConstraint),
     _rule_constraint_factory(NoJapanesePunctuationConstraint),
@@ -319,7 +351,7 @@ TRAINING_CHARACTER_CONSTRAINTS += [
     _rule_constraint_factory(RomajiCharacterConstraint),
     _rule_constraint_factory(UppercaseCharacterConstraint),
 ]
-TRAINING_RULE_BASED_CONTENT_CONSTRAINTS: list[RuleConstraintFactory] = [
+TRAINING_RULE_BASED_CONTENT_CONSTRAINTS: list[ConstraintFactory] = [
     _rule_constraint_factory(
         KeywordExcludedContentConstraint,
         keywords=["月", "火", "水", "木", "金", "土", "日"],
@@ -329,7 +361,7 @@ TRAINING_RULE_BASED_CONTENT_CONSTRAINTS: list[RuleConstraintFactory] = [
         keywords={"日本": 1, "東京": 10},
     ),
 ]
-TRAINING_LLM_CONTENT_CONSTRAINTS: list[LLMConstraintFactory] = [
+TRAINING_LLM_CONTENT_CONSTRAINTS: list[ConstraintFactory] = [
     _llm_constraint_factory(
         AbstractExcludedContentConstraint,
         uses_document=True,
@@ -345,7 +377,7 @@ TRAINING_LLM_CONTENT_CONSTRAINTS: list[LLMConstraintFactory] = [
     _llm_constraint_factory(IrrevantContentConstraint, uses_document=True),
     _llm_constraint_factory(NoReasonContentConstraint),
 ]
-TRAINING_FORMAT_CONSTRAINTS: list[RuleConstraintFactory] = [
+TRAINING_FORMAT_CONSTRAINTS: list[ConstraintFactory] = [
     _rule_constraint_factory(BulletPointsFormatConstraint, starter_token="*_*"),
     _rule_constraint_factory(CitationFormatConstraint),
     _rule_constraint_factory(CsvFormatConstraint),
@@ -381,7 +413,7 @@ TRAINING_FORMAT_CONSTRAINTS += [
     _rule_constraint_factory(WithCodeFencePythonFormatConstraint),
     _rule_constraint_factory(SentenceDelimiterFormatConstraint, delimiter="(これは文末です)"),
 ]
-TRAINING_LENGTH_CONSTRAINTS: list[RuleConstraintFactory] = [
+TRAINING_LENGTH_CONSTRAINTS: list[ConstraintFactory] = [
     _rule_constraint_factory(
         CharactersLengthConstraint,
         min_length=100,
@@ -408,7 +440,7 @@ TRAINING_LENGTH_CONSTRAINTS += [
     _rule_constraint_factory(NewLinesLengthConstraint, newlines=3),
     _rule_constraint_factory(BlankLinesLengthConstraint, blank_lines=2),
 ]
-TRAINING_LOGIC_CONSTRAINTS: list[RuleConstraintFactory] = [
+TRAINING_LOGIC_CONSTRAINTS: list[ConstraintFactory] = [
     lambda seed=None, document=None: NegationLogicConstraint(
         positive_constraint=NoWhitespaceConstraint(seed=seed),
         seed=seed,
@@ -450,7 +482,7 @@ TRAINING_LOGIC_CONSTRAINTS: list[RuleConstraintFactory] = [
         seed=seed,
     ),
 ]
-TRAINING_META_OUTPUT_CONSTRAINTS: list[LLMConstraintFactory] = [
+TRAINING_META_OUTPUT_CONSTRAINTS: list[ConstraintFactory] = [
     _llm_constraint_factory(NoExplanationConstraint),
     _llm_constraint_factory(NoGreetingOutputConstraint),
     _llm_constraint_factory(NoSelfReferenceConstraint),
@@ -460,7 +492,7 @@ TRAINING_META_OUTPUT_CONSTRAINTS: list[LLMConstraintFactory] = [
     _llm_constraint_factory(NoSelfAttestationConstraint),
     _llm_constraint_factory(SelfReferenceConstraint),
 ]
-TRAINING_NOTATION_CONSTRAINTS: list[RuleConstraintFactory] = [
+TRAINING_NOTATION_CONSTRAINTS: list[ConstraintFactory] = [
     _rule_constraint_factory(DecimalPlacesNotationConstraint, required_decimal_places=5),
     _rule_constraint_factory(EmailAddressNotationConstraint),
     _rule_constraint_factory(GroupingNotationConstraint, max_group_size=3),
@@ -481,7 +513,7 @@ TRAINING_NOTATION_CONSTRAINTS: list[RuleConstraintFactory] = [
     _rule_constraint_factory(UnitNotationConstraint),
     _rule_constraint_factory(ZeroPaddingNotationConstraint, width=5),
 ]
-TRAINING_RULE_BASED_PROCESSING_CONSTRAINTS: list[RuleConstraintFactory] = [
+TRAINING_RULE_BASED_PROCESSING_CONSTRAINTS: list[ConstraintFactory] = [
     _rule_constraint_factory(PrefixProcessingConstraint, prefix="<これは文頭です>"),
     _rule_constraint_factory(SuffixProcessingConstraint, suffix="<これは文末です>"),
     _rule_constraint_factory(ConcatProcessingConstraint, uses_document=True, times=2),
@@ -502,7 +534,7 @@ TRAINING_RULE_BASED_PROCESSING_CONSTRAINTS: list[RuleConstraintFactory] = [
     ),
     _rule_constraint_factory(SuffixExtractionProcessingConstraint, uses_document=True, length=4),
 ]
-TRAINING_LLM_PROCESSING_CONSTRAINTS: list[LLMConstraintFactory] = [
+TRAINING_LLM_PROCESSING_CONSTRAINTS: list[ConstraintFactory] = [
     _llm_constraint_factory(
         ExtractionProcessingConstraint,
         uses_document=True,
@@ -514,12 +546,12 @@ TRAINING_LLM_PROCESSING_CONSTRAINTS: list[LLMConstraintFactory] = [
         statistic="含まれる固有名詞の数",
     ),
 ]
-TRAINING_STRUCTURE_CONSTRAINTS: list[LLMConstraintFactory] = [
+TRAINING_STRUCTURE_CONSTRAINTS: list[ConstraintFactory] = [
     _llm_constraint_factory(HeadingStructureConstraint),
     _llm_constraint_factory(SectionStructureConstraint),
 ]
-TRAINING_RULE_BASED_STYLE_CONSTRAINTS: list[RuleConstraintFactory] = []
-TRAINING_LLM_STYLE_CONSTRAINTS: list[LLMConstraintFactory] = [
+TRAINING_RULE_BASED_STYLE_CONSTRAINTS: list[ConstraintFactory] = []
+TRAINING_LLM_STYLE_CONSTRAINTS: list[ConstraintFactory] = [
     _llm_constraint_factory(EnglishStyleConstraint),
     _llm_constraint_factory(JapaneseStyleConstraint),
     _llm_constraint_factory(BritishEnglishStyleConstraint),
@@ -546,35 +578,35 @@ TRAINING_LLM_STYLE_CONSTRAINTS: list[LLMConstraintFactory] = [
     _llm_constraint_factory(SadEmotionalStyleConstraint),
     _llm_constraint_factory(TaigendomeStyleConstraint),
 ]
-TRAINING_IFBENCH_COUNT_CONSTRAINTS: list[RuleConstraintFactory] = []
-TRAINING_IFBENCH_FORMAT_CONSTRAINTS: list[RuleConstraintFactory] = []
-TRAINING_IFBENCH_RATIO_CONSTRAINTS: list[RuleConstraintFactory] = []
-TRAINING_IFBENCH_REPEAT_CONSTRAINTS: list[RuleConstraintFactory] = []
-TRAINING_IFBENCH_SENTENCE_CONSTRAINTS: list[RuleConstraintFactory] = []
-TRAINING_IFBENCH_WORDS_CONSTRAINTS: list[RuleConstraintFactory] = []
+TRAINING_IFBENCH_COUNT_CONSTRAINTS: list[ConstraintFactory] = []
+TRAINING_IFBENCH_FORMAT_CONSTRAINTS: list[ConstraintFactory] = []
+TRAINING_IFBENCH_RATIO_CONSTRAINTS: list[ConstraintFactory] = []
+TRAINING_IFBENCH_REPEAT_CONSTRAINTS: list[ConstraintFactory] = []
+TRAINING_IFBENCH_SENTENCE_CONSTRAINTS: list[ConstraintFactory] = []
+TRAINING_IFBENCH_WORDS_CONSTRAINTS: list[ConstraintFactory] = []
 
-TEST_CHARACTER_CONSTRAINTS: list[RuleConstraintFactory] = list(TRAINING_CHARACTER_CONSTRAINTS)
-TEST_RULE_BASED_CONTENT_CONSTRAINTS: list[RuleConstraintFactory] = list(
+TEST_CHARACTER_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_CHARACTER_CONSTRAINTS)
+TEST_RULE_BASED_CONTENT_CONSTRAINTS: list[ConstraintFactory] = list(
     TRAINING_RULE_BASED_CONTENT_CONSTRAINTS
 )
-TEST_LLM_CONTENT_CONSTRAINTS: list[LLMConstraintFactory] = list(TRAINING_LLM_CONTENT_CONSTRAINTS)
-TEST_FORMAT_CONSTRAINTS: list[RuleConstraintFactory] = list(TRAINING_FORMAT_CONSTRAINTS)
-TEST_LENGTH_CONSTRAINTS: list[RuleConstraintFactory] = list(TRAINING_LENGTH_CONSTRAINTS)
-TEST_LOGIC_CONSTRAINTS: list[RuleConstraintFactory] = list(TRAINING_LOGIC_CONSTRAINTS)
-TEST_META_OUTPUT_CONSTRAINTS: list[LLMConstraintFactory] = list(TRAINING_META_OUTPUT_CONSTRAINTS)
-TEST_NOTATION_CONSTRAINTS: list[RuleConstraintFactory] = list(TRAINING_NOTATION_CONSTRAINTS)
-TEST_RULE_BASED_PROCESSING_CONSTRAINTS: list[RuleConstraintFactory] = list(
+TEST_LLM_CONTENT_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_LLM_CONTENT_CONSTRAINTS)
+TEST_FORMAT_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_FORMAT_CONSTRAINTS)
+TEST_LENGTH_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_LENGTH_CONSTRAINTS)
+TEST_LOGIC_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_LOGIC_CONSTRAINTS)
+TEST_META_OUTPUT_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_META_OUTPUT_CONSTRAINTS)
+TEST_NOTATION_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_NOTATION_CONSTRAINTS)
+TEST_RULE_BASED_PROCESSING_CONSTRAINTS: list[ConstraintFactory] = list(
     TRAINING_RULE_BASED_PROCESSING_CONSTRAINTS
 )
-TEST_LLM_PROCESSING_CONSTRAINTS: list[LLMConstraintFactory] = list(
+TEST_LLM_PROCESSING_CONSTRAINTS: list[ConstraintFactory] = list(
     TRAINING_LLM_PROCESSING_CONSTRAINTS
 )
-TEST_STRUCTURE_CONSTRAINTS: list[LLMConstraintFactory] = list(TRAINING_STRUCTURE_CONSTRAINTS)
-TEST_RULE_BASED_STYLE_CONSTRAINTS: list[RuleConstraintFactory] = list(
+TEST_STRUCTURE_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_STRUCTURE_CONSTRAINTS)
+TEST_RULE_BASED_STYLE_CONSTRAINTS: list[ConstraintFactory] = list(
     TRAINING_RULE_BASED_STYLE_CONSTRAINTS
 )
-TEST_LLM_STYLE_CONSTRAINTS: list[LLMConstraintFactory] = list(TRAINING_LLM_STYLE_CONSTRAINTS)
-TEST_IFBENCH_COUNT_CONSTRAINTS: list[RuleConstraintFactory] = [
+TEST_LLM_STYLE_CONSTRAINTS: list[ConstraintFactory] = list(TRAINING_LLM_STYLE_CONSTRAINTS)
+TEST_IFBENCH_COUNT_CONSTRAINTS: list[ConstraintFactory] = [
     *TRAINING_IFBENCH_COUNT_CONSTRAINTS,
     _rule_constraint_factory(ConjunctionCountIfbenchConstraint, minimum_kinds=4),
     _rule_constraint_factory(NumbersCountIfbenchConstraint, expected_count=13),
@@ -583,7 +615,7 @@ TEST_IFBENCH_COUNT_CONSTRAINTS: list[RuleConstraintFactory] = [
     _rule_constraint_factory(PunctuationCountIfbenchConstraint),
     _rule_constraint_factory(UniqueWordCountIfbenchConstraint, minimum_unique=360),
 ]
-TEST_IFBENCH_FORMAT_CONSTRAINTS: list[RuleConstraintFactory] = [
+TEST_IFBENCH_FORMAT_CONSTRAINTS: list[ConstraintFactory] = [
     *TRAINING_IFBENCH_FORMAT_CONSTRAINTS,
     _rule_constraint_factory(EmojiFormatIfbenchConstraint),
     _rule_constraint_factory(LineIndentFormatIfbenchConstraint),
@@ -595,7 +627,7 @@ TEST_IFBENCH_FORMAT_CONSTRAINTS: list[RuleConstraintFactory] = [
     _rule_constraint_factory(SubBulletsFormatIfbenchConstraint),
     _rule_constraint_factory(ThesisFormatIfbenchConstraint),
 ]
-TEST_IFBENCH_RATIO_CONSTRAINTS: list[RuleConstraintFactory] = [
+TEST_IFBENCH_RATIO_CONSTRAINTS: list[ConstraintFactory] = [
     *TRAINING_IFBENCH_RATIO_CONSTRAINTS,
     _rule_constraint_factory(
         OverlapRatioIfbenchConstraint, uses_document=True, target_ratio_percent=72
@@ -605,18 +637,18 @@ TEST_IFBENCH_RATIO_CONSTRAINTS: list[RuleConstraintFactory] = [
     _rule_constraint_factory(SentenceWordsRatioIfbenchConstraint),
     _rule_constraint_factory(StopWordsRatioIfbenchConstraint, max_ratio_percent=27),
 ]
-TEST_IFBENCH_REPEAT_CONSTRAINTS: list[RuleConstraintFactory] = [
+TEST_IFBENCH_REPEAT_CONSTRAINTS: list[ConstraintFactory] = [
     *TRAINING_IFBENCH_REPEAT_CONSTRAINTS,
     _rule_constraint_factory(ChangeRepeatIfbenchConstraint, uses_document=True),
     _rule_constraint_factory(SimpleRepeatIfbenchConstraint),
 ]
-TEST_IFBENCH_SENTENCE_CONSTRAINTS: list[RuleConstraintFactory] = [
+TEST_IFBENCH_SENTENCE_CONSTRAINTS: list[ConstraintFactory] = [
     *TRAINING_IFBENCH_SENTENCE_CONSTRAINTS,
     _rule_constraint_factory(AlliterationIncrementSentenceIfbenchConstraint),
     _rule_constraint_factory(IncrementSentenceIfbenchConstraint, increment=3),
     _rule_constraint_factory(KeywordSentenceIfbenchConstraint, sentence_index=7, keyword="AI"),
 ]
-TEST_IFBENCH_WORDS_CONSTRAINTS: list[RuleConstraintFactory] = [
+TEST_IFBENCH_WORDS_CONSTRAINTS: list[ConstraintFactory] = [
     *TRAINING_IFBENCH_WORDS_CONSTRAINTS,
     _rule_constraint_factory(ConsonantsWordsIfbenchConstraint),
     _rule_constraint_factory(
@@ -693,7 +725,7 @@ TEST_CONSTRAINT_COLLECTIONS = ConstraintCollections(
     ifbench_words=TEST_IFBENCH_WORDS_CONSTRAINTS,
 )
 CONSTRAINT_COLLECTIONS: dict[ConstraintSetName, ConstraintCollections] = {
-    "training": TRAINING_CONSTRAINT_COLLECTIONS,
+    "train": TRAINING_CONSTRAINT_COLLECTIONS,
     "test": TEST_CONSTRAINT_COLLECTIONS,
 }
 
@@ -707,7 +739,7 @@ class MetaData:
     constraint_groups: list[str]
     constraint_instructions: list[str]
     prompt: str
-    constraint_set: ConstraintSetName = "training"
+    constraint_set: ConstraintSetName = "train"
 
 
 @dataclass
@@ -869,16 +901,47 @@ class BenchmarkData:
         try:
             evaluation = constraint.evaluate(value)
             if inspect.isawaitable(evaluation):
-                evaluation = await evaluation
+                evaluations: list[Any] = [evaluation]
+                for _ in range(2):
+                    evaluations.append(constraint.evaluate(value))
+                awaitable_indices = [
+                    index
+                    for index, candidate in enumerate(evaluations)
+                    if inspect.isawaitable(candidate)
+                ]
+                awaitable_values = await asyncio.gather(
+                    *[cast("Awaitable[Any]", evaluations[index]) for index in awaitable_indices]
+                )
+                for index, awaited in zip(awaitable_indices, awaitable_values, strict=True):
+                    evaluations[index] = awaited
+                evaluation_candidates = [
+                    self._coerce_constraint_evaluation(candidate) for candidate in evaluations
+                ]
+                passed_count = sum(1 for passed, _ in evaluation_candidates if passed)
+                failed_count = len(evaluation_candidates) - passed_count
+                majority_passed = passed_count > failed_count
+                reason = next(
+                    (
+                        candidate_reason
+                        for candidate_passed, candidate_reason in evaluation_candidates
+                        if candidate_passed == majority_passed
+                    ),
+                    None,
+                )
+                passed_bool = bool(majority_passed)
+                normalized_reason = None if reason is None else str(reason)
+                if not passed_bool:
+                    if normalized_reason is None:
+                        normalized_reason = (
+                            f"[{constraint.__class__.__name__}] Constraint evaluation failed."
+                        )
+                    logging.getLogger(constraint.__class__.__module__).info(normalized_reason)
+                return passed_bool, normalized_reason
         except Exception as e:
             reason = f"Evaluation fails for ID {self.meta_data.data_id} due to {e}."
             tqdm.write(reason)
             return False, reason
-        if isinstance(evaluation, tuple) and len(evaluation) == 2:
-            passed, reason = evaluation
-        else:
-            passed = bool(evaluation)
-            reason = None
+        passed, reason = self._coerce_constraint_evaluation(evaluation)
         passed_bool = bool(passed)
         normalized_reason = None if reason is None else str(reason)
         if not passed_bool:
@@ -888,6 +951,15 @@ class BenchmarkData:
                 )
             logging.getLogger(constraint.__class__.__module__).info(normalized_reason)
         return passed_bool, normalized_reason
+
+    @staticmethod
+    def _coerce_constraint_evaluation(evaluation: Any) -> ConstraintEvaluation:
+        if isinstance(evaluation, tuple) and len(evaluation) == 2:
+            passed, reason = evaluation
+        else:
+            passed = bool(evaluation)
+            reason = None
+        return bool(passed), None if reason is None else str(reason)
 
     async def _rewrite_once(
         self,
@@ -967,7 +1039,7 @@ def get_benchmark_data_with_single_constraint(
     prompts: Sequence[Prompt],
     prompt_source: str,
     seed: int,
-    constraint_set: ConstraintSetName = "training",
+    constraint_set: ConstraintSetName = "train",
 ) -> list[BenchmarkData]:
     benchmark_data_list = []
     constraint_collections = get_constraint_collections(constraint_set)
@@ -1027,7 +1099,7 @@ def get_benchmark_data_with_single_constraint(
 def get_ifbench_benchmark_data(
     client: LLMClient,
     seed: int,
-    constraint_set: ConstraintSetName = "training",
+    constraint_set: ConstraintSetName = "train",
     dataset_path: str | None = None,
 ) -> list[BenchmarkData]:
     prompts = get_all_ifbench_prompts(dataset_path=dataset_path)
@@ -1047,7 +1119,7 @@ def get_benchmark_data_with_multiple_constraints(
     n_benchmark_data: int,
     seed: int,
     prompt_source: str,
-    constraint_set: ConstraintSetName = "training",
+    constraint_set: ConstraintSetName = "train",
 ) -> list[BenchmarkData]:
     assert n_constraints >= 2, "n_constraints must be at least 2."
     benchmark_data_list: list[BenchmarkData] = []
@@ -1096,7 +1168,7 @@ def get_benchmark_data_with_multiple_constraints(
                 return False
 
             def _build_constraint(
-                factory: RuleConstraintFactory | LLMConstraintFactory,
+                factory: ConstraintFactory,
             ) -> Constraint:
                 if factory in constraint_collections.rule_based:
                     return factory(
@@ -1109,7 +1181,7 @@ def get_benchmark_data_with_multiple_constraints(
                     seed=int(rng.integers(0, 2**63 - 1)),
                 )
 
-            def _try_add_constraint(factory: RuleConstraintFactory | LLMConstraintFactory) -> bool:
+            def _try_add_constraint(factory: ConstraintFactory) -> bool:
                 nonlocal sampling_attempts
                 candidate = _build_constraint(factory)
                 if _conflicts_with_existing(candidate):
@@ -1122,7 +1194,7 @@ def get_benchmark_data_with_multiple_constraints(
             format_constraint_factory = rng.choice(constraint_collections.format)
             _try_add_constraint(format_constraint_factory)
 
-            group_to_factories: dict[str, list[RuleConstraintFactory | LLMConstraintFactory]] = {
+            group_to_factories: dict[str, list[ConstraintFactory]] = {
                 "character": list(constraint_collections.character),
                 "content": constraint_collections.rule_content
                 + constraint_collections.llm_content,
@@ -1195,7 +1267,7 @@ def get_ifbench_benchmark_data_with_multiple_constraints(
     n_constraints: int,
     n_benchmark_data: int,
     seed: int,
-    constraint_set: ConstraintSetName = "training",
+    constraint_set: ConstraintSetName = "train",
     dataset_path: str | None = None,
 ) -> list[BenchmarkData]:
     prompts = get_all_ifbench_prompts(dataset_path=dataset_path)

@@ -29,6 +29,9 @@ class DummyConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 def test_negation_constraint_inverts_positive_constraint() -> None:
     positive = DummyConstraint(result=True, instructions_text="Provide a number")

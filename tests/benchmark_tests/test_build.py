@@ -80,6 +80,9 @@ class _SyncConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 class _AsyncConstraint:
     def __init__(self) -> None:
@@ -104,6 +107,73 @@ class _AsyncConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
+
+class _AsyncVotingConstraint:
+    def __init__(self, outcomes: list[bool]) -> None:
+        self._outcomes = outcomes
+        self.seen: list[str] = []
+        self.calls = 0
+
+    async def evaluate(self, value: str) -> tuple[bool, str | None]:
+        self.seen.append(value)
+        outcome = self._outcomes[self.calls]
+        self.calls += 1
+        await asyncio.sleep(0)
+        return outcome, None if outcome else "failed"
+
+    def instructions(self, train_or_test: str = "train") -> str:
+        return "stub"
+
+    @property
+    def group(self) -> str:
+        return "Test"
+
+    def rewrite_instructions(self) -> str:
+        return "rewrite async voting"
+
+    @property
+    def competitives(self) -> list[str]:
+        return []
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
+
+class _AsyncParallelConstraint:
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.calls = 0
+
+    async def evaluate(self, value: str) -> tuple[bool, None]:
+        _ = value
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0)
+        self.active -= 1
+        return True, None
+
+    def instructions(self, train_or_test: str = "train") -> str:
+        return "stub"
+
+    @property
+    def group(self) -> str:
+        return "Test"
+
+    def rewrite_instructions(self) -> str:
+        return "rewrite async parallel"
+
+    @property
+    def competitives(self) -> list[str]:
+        return []
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 class _TokenConstraint:
     def __init__(self, token: str) -> None:
@@ -125,6 +195,9 @@ class _TokenConstraint:
     @property
     def competitives(self) -> list[str]:
         return []
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {"token": self.token}
 
 
 class _RewriteValueConstraint:
@@ -152,6 +225,9 @@ class _RewriteValueConstraint:
     @property
     def competitives(self) -> list[str]:
         return []
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
 
 
 class _RewriteClient:
@@ -192,6 +268,9 @@ class _UppercaseRewriteConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 class _FormatConstraint:
     def evaluate(self, value: str) -> tuple[bool, None]:
@@ -210,6 +289,9 @@ class _FormatConstraint:
     @property
     def competitives(self) -> list[str]:
         return ["_ConflictingConstraint"]
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
 
 
 class _AlternateFormatConstraint:
@@ -230,6 +312,9 @@ class _AlternateFormatConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 class _CharacterConstraint:
     def evaluate(self, value: str) -> tuple[bool, None]:
@@ -248,6 +333,9 @@ class _CharacterConstraint:
     @property
     def competitives(self) -> list[str]:
         return []
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
 
 
 class _ConflictingConstraint:
@@ -268,6 +356,9 @@ class _ConflictingConstraint:
     def competitives(self) -> list[str]:
         return ["_FormatConstraint"]
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 class _SafeConstraint:
     def evaluate(self, value: str) -> tuple[bool, None]:
@@ -286,6 +377,9 @@ class _SafeConstraint:
     @property
     def competitives(self) -> list[str]:
         return []
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
 
 
 class _ContentConstraint:
@@ -306,8 +400,12 @@ class _ContentConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
+
 
 _TEST_PROMPT_SOURCE = "test_source"
+_ASYNC_EVAL_TRIALS = 3
 
 
 def _make_benchmark(constraints: Sequence[Constraint]) -> BenchmarkData:
@@ -368,7 +466,76 @@ def test_benchmark_data_evaluate_handles_async_constraints() -> None:
     results = asyncio.run(data.evaluate("value"))
 
     assert results == {"_AsyncConstraint": False}
-    assert constraint.seen == ["value"]
+    assert constraint.seen == ["value"] * _ASYNC_EVAL_TRIALS
+
+
+def test_benchmark_data_evaluate_uses_majority_vote_for_awaitable_evaluations() -> None:
+    constraint = _AsyncVotingConstraint([True, False, True])
+    data = BenchmarkData(
+        prompt=_StubPrompt(),
+        constraints=[constraint],
+        meta_data=MetaData(
+            prompt_source=_TEST_PROMPT_SOURCE,
+            data_id="test-async-majority",
+            n_constraints=1,
+            constraint_types=["_AsyncVotingConstraint"],
+            constraint_groups=["Test"],
+            constraint_instructions=["stub"],
+            prompt="prompt",
+        ),
+    )
+
+    results = asyncio.run(data.evaluate("value"))
+
+    assert results == {"_AsyncVotingConstraint": True}
+    assert constraint.calls == _ASYNC_EVAL_TRIALS
+    assert constraint.seen == ["value"] * _ASYNC_EVAL_TRIALS
+
+
+def test_benchmark_data_evaluate_uses_majority_vote_for_awaitable_failures() -> None:
+    constraint = _AsyncVotingConstraint([False, True, False])
+    data = BenchmarkData(
+        prompt=_StubPrompt(),
+        constraints=[constraint],
+        meta_data=MetaData(
+            prompt_source=_TEST_PROMPT_SOURCE,
+            data_id="test-async-majority-failure",
+            n_constraints=1,
+            constraint_types=["_AsyncVotingConstraint"],
+            constraint_groups=["Test"],
+            constraint_instructions=["stub"],
+            prompt="prompt",
+        ),
+    )
+
+    results = asyncio.run(data.evaluate("value"))
+
+    assert results == {"_AsyncVotingConstraint": False}
+    assert constraint.calls == _ASYNC_EVAL_TRIALS
+    assert constraint.seen == ["value"] * _ASYNC_EVAL_TRIALS
+
+
+def test_benchmark_data_evaluate_runs_awaitable_trials_in_parallel() -> None:
+    constraint = _AsyncParallelConstraint()
+    data = BenchmarkData(
+        prompt=_StubPrompt(),
+        constraints=[constraint],
+        meta_data=MetaData(
+            prompt_source=_TEST_PROMPT_SOURCE,
+            data_id="test-async-parallel",
+            n_constraints=1,
+            constraint_types=["_AsyncParallelConstraint"],
+            constraint_groups=["Test"],
+            constraint_instructions=["stub"],
+            prompt="prompt",
+        ),
+    )
+
+    results = asyncio.run(data.evaluate("value"))
+
+    assert results == {"_AsyncParallelConstraint": True}
+    assert constraint.calls == _ASYNC_EVAL_TRIALS
+    assert constraint.max_active > 1
 
 
 def test_benchmark_data_rewrite_returns_input_when_already_valid() -> None:
@@ -417,7 +584,7 @@ def test_build_meta_data_records_prompt_and_instructions() -> None:
         data_id="meta-test",
         prompt=_StubPrompt(),
         constraints=[constraint],
-        constraint_set="training",
+        constraint_set="train",
     )
     assert meta.prompt == "prompt"
     assert meta.constraint_instructions == ["Include needle"]
@@ -447,6 +614,9 @@ class _ReasonTokenConstraint:
     def competitives(self) -> list[str]:
         return []
 
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {"token": self.token, "reason": self.reason}
+
 
 class _NoRewriteInstructionsConstraint:
     def evaluate(self, value: str) -> tuple[bool, None]:
@@ -465,6 +635,9 @@ class _NoRewriteInstructionsConstraint:
     @property
     def competitives(self) -> list[str]:
         return []
+
+    def to_serializable_kwargs(self) -> dict[str, object]:
+        return {}
 
 
 def test_benchmark_data_rewrite_prompts_include_all_constraints() -> None:
@@ -564,7 +737,7 @@ def test_benchmark_data_rewrite_falls_back_to_instruction_when_missing_rewrite()
 
 
 def test_get_constraint_collections_includes_training_sets(true_client: "LLMClient") -> None:
-    collections = get_constraint_collections("training")
+    collections = get_constraint_collections("train")
 
     rule_instance = None
     for factory in collections.rule_based:
@@ -611,6 +784,17 @@ def test_get_constraint_collections_includes_ifbench_test_sets(true_client: "LLM
 def test_get_constraint_collections_rejects_unknown_set() -> None:
     with pytest.raises(ValueError):
         get_constraint_collections(cast("ConstraintSetName", "unknown"))
+
+
+def test_rule_constraint_factory_exposes_kwargs() -> None:
+    collections = get_constraint_collections("train")
+    factory = next(
+        factory
+        for factory in collections.length
+        if isinstance(factory(seed=0, document="sample"), WordsLengthConstraint)
+    )
+
+    assert getattr(factory, "kwargs", {}) == {"minimum": 10, "maximum": 20}
 
 
 class _DeterministicRng:
@@ -699,7 +883,7 @@ def test_get_benchmark_data_with_single_constraint_shuffles(
         prompts,
         prompt_source="test_source",
         seed=123,
-        constraint_set="training",
+        constraint_set="train",
     )
 
     assert seed_values == [123]

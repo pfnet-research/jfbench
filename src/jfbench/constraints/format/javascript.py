@@ -137,6 +137,8 @@ def is_valid_js(src: str) -> tuple[bool, str | None]:
             return True, None
         except esprima.Error as e_scr:
             return False, f"Module error: {e_mod}; Script error: {e_scr}"
+    except Exception as e:
+        return False, f"Unexpected error during parsing: {e}"
 
 
 __all__ = [

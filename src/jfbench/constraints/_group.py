@@ -1,8 +1,11 @@
+import importlib
 import inspect
+import json
 from pathlib import Path
 import random
 import secrets
 import sys
+from typing import Any
 from typing import ClassVar
 from typing import Sequence
 
@@ -85,3 +88,100 @@ class ConstraintGroupMixin:
         if self._instruction_choice is None:
             self._instruction_choice = self._instruction_rng.choice(list(options))
         return self._instruction_choice
+
+    def to_serializable_kwargs(self) -> dict[str, Any]:
+        signature = inspect.signature(self.__class__.__init__)
+        kwargs: dict[str, Any] = {}
+        for name in signature.parameters:
+            if name in {"self", "seed"}:
+                continue
+            if hasattr(self, name):
+                kwargs[name] = self._serialize_value(getattr(self, name))
+        return kwargs
+
+    def to_serializable_dict(self) -> dict[str, Any]:
+        return {
+            "module": self.__class__.__module__,
+            "name": self.__class__.__name__,
+            "kwargs": self.to_serializable_kwargs(),
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(
+            self.to_serializable_dict(),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_serializable_dict(cls, payload: dict[str, Any]) -> "ConstraintGroupMixin":
+        module_name = str(payload["module"])
+        class_name = str(payload["name"])
+        kwargs = payload.get("kwargs", {})
+        if not isinstance(kwargs, dict):
+            raise TypeError("Constraint payload kwargs must be a dict.")
+
+        module = importlib.import_module(module_name)
+        target_cls = getattr(module, class_name)
+        if not isinstance(target_cls, type) or not issubclass(target_cls, ConstraintGroupMixin):
+            raise TypeError(f"{module_name}.{class_name} is not a ConstraintGroupMixin subclass.")
+        restored_kwargs = cls._deserialize_value(kwargs)
+        if not isinstance(restored_kwargs, dict):
+            raise TypeError("Restored constraint kwargs must be a dict.")
+        return target_cls(**restored_kwargs)
+
+    @classmethod
+    def from_json(cls, payload: str) -> "ConstraintGroupMixin":
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise TypeError("Constraint JSON payload must decode to an object.")
+        return cls.from_serializable_dict(data)
+
+    @classmethod
+    def _serialize_value(cls, value: Any) -> Any:
+        from jfbench.llm import LLMClient
+
+        if isinstance(value, ConstraintGroupMixin):
+            return {"__type__": "constraint", "value": value.to_serializable_dict()}
+        if isinstance(value, LLMClient):
+            return {"__type__": "llm_client", "value": value.to_serializable_dict()}
+        if hasattr(value, "to_serializable_dict") and callable(value.to_serializable_dict):
+            return {"__type__": "object", "value": value.to_serializable_dict()}
+        if isinstance(value, list):
+            return [cls._serialize_value(item) for item in value]
+        if isinstance(value, tuple):
+            return {"__type__": "tuple", "value": [cls._serialize_value(item) for item in value]}
+        if isinstance(value, dict):
+            return {str(key): cls._serialize_value(item) for key, item in value.items()}
+        if isinstance(value, bool | int | float | str) or value is None:
+            return value
+        return {"__type__": "opaque", "value": repr(value)}
+
+    @classmethod
+    def _deserialize_value(cls, value: Any) -> Any:
+        from jfbench.llm import LLMClient
+
+        if isinstance(value, list):
+            return [cls._deserialize_value(item) for item in value]
+        if isinstance(value, dict):
+            marker = value.get("__type__")
+            if marker == "constraint":
+                payload = value.get("value", {})
+                if not isinstance(payload, dict):
+                    raise TypeError("Invalid serialized constraint payload.")
+                return cls.from_serializable_dict(payload)
+            if marker == "llm_client":
+                payload = value.get("value", {})
+                if not isinstance(payload, dict):
+                    raise TypeError("Invalid serialized LLM client payload.")
+                return LLMClient.from_serializable_dict(payload)
+            if marker == "tuple":
+                members = value.get("value", [])
+                if not isinstance(members, list):
+                    raise TypeError("Invalid serialized tuple payload.")
+                return tuple(cls._deserialize_value(item) for item in members)
+            if marker == "opaque":
+                return str(value.get("value", ""))
+            return {key: cls._deserialize_value(item) for key, item in value.items()}
+        return value
