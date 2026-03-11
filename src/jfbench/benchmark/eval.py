@@ -674,7 +674,7 @@ def _upsert_entries(results_path: Path, entries: list[dict[str, Any]]) -> None:
         sort_by = list(subset)
         merged = merged.drop_duplicates(subset=subset, keep="last")
         merged = merged.sort_values(by=sort_by).reset_index(drop=True)
-    json_lines = merged.to_json(orient="records", lines=True, index=False)
+    json_lines = merged.to_json(orient="records", force_ascii=False, lines=True, index=False)
     if json_lines:
         results_path.write_text(json_lines, encoding="utf-8")
 
