@@ -182,6 +182,7 @@ from jfbench.constraints.style import SadEmotionalStyleConstraint
 from jfbench.constraints.style import TaigendomeStyleConstraint
 from jfbench.llm import extract_reasoning_content
 from jfbench.llm import LLMClient
+from jfbench.llm import RetryableLLMError
 from jfbench.prompts.ifbench import get_all_ifbench_prompts
 from jfbench.protocol import Constraint
 from jfbench.protocol import ConstraintEvaluation
@@ -189,6 +190,7 @@ from jfbench.protocol import Prompt
 
 
 logger = logging.getLogger(__name__)
+ASYNC_EVALUATION_TRIALS = 3
 
 
 def _stable_seed(*parts: str) -> int:
@@ -897,50 +899,78 @@ class BenchmarkData:
         constraint: Constraint,
         value: str,
     ) -> ConstraintEvaluation:
-        reason: str | None
         try:
             evaluation = constraint.evaluate(value)
-            if inspect.isawaitable(evaluation):
-                evaluations: list[Any] = [evaluation]
-                for _ in range(2):
-                    evaluations.append(constraint.evaluate(value))
-                awaitable_indices = [
-                    index
-                    for index, candidate in enumerate(evaluations)
-                    if inspect.isawaitable(candidate)
-                ]
-                awaitable_values = await asyncio.gather(
-                    *[cast("Awaitable[Any]", evaluations[index]) for index in awaitable_indices]
-                )
-                for index, awaited in zip(awaitable_indices, awaitable_values, strict=True):
-                    evaluations[index] = awaited
-                evaluation_candidates = [
-                    self._coerce_constraint_evaluation(candidate) for candidate in evaluations
-                ]
-                passed_count = sum(1 for passed, _ in evaluation_candidates if passed)
-                failed_count = len(evaluation_candidates) - passed_count
-                majority_passed = passed_count > failed_count
-                reason = next(
-                    (
-                        candidate_reason
-                        for candidate_passed, candidate_reason in evaluation_candidates
-                        if candidate_passed == majority_passed
-                    ),
-                    None,
-                )
-                passed_bool = bool(majority_passed)
-                normalized_reason = None if reason is None else str(reason)
-                if not passed_bool:
-                    if normalized_reason is None:
-                        normalized_reason = (
-                            f"[{constraint.__class__.__name__}] Constraint evaluation failed."
-                        )
-                    logging.getLogger(constraint.__class__.__module__).info(normalized_reason)
-                return passed_bool, normalized_reason
+        except RetryableLLMError:
+            raise
         except Exception as e:
             reason = f"Evaluation fails for ID {self.meta_data.data_id} due to {e}."
             tqdm.write(reason)
             return False, reason
+
+        if inspect.isawaitable(evaluation):
+            return await self._evaluate_awaitable_constraint(
+                constraint,
+                value,
+                cast("Awaitable[Any]", evaluation),
+            )
+        return self._finalize_constraint_evaluation(constraint, evaluation)
+
+    async def _evaluate_awaitable_constraint(
+        self,
+        constraint: Constraint,
+        value: str,
+        first_evaluation: Awaitable[Any],
+    ) -> ConstraintEvaluation:
+        evaluations = await asyncio.gather(
+            self._evaluate_awaitable_trial(
+                constraint,
+                value,
+                first_evaluation,
+            ),
+            *[
+                self._evaluate_awaitable_trial(constraint, value)
+                for _ in range(ASYNC_EVALUATION_TRIALS - 1)
+            ],
+        )
+        passed_count = sum(passed for passed, _ in evaluations)
+        passed = passed_count > len(evaluations) // 2
+        reason = None
+        if not passed:
+            reason = next(
+                (failure_reason for passed, failure_reason in evaluations if not passed),
+                None,
+            )
+        return self._finalize_constraint_evaluation(constraint, (passed, reason))
+
+    async def _evaluate_awaitable_trial(
+        self,
+        constraint: Constraint,
+        value: str,
+        evaluation: Awaitable[Any] | None = None,
+    ) -> ConstraintEvaluation:
+        reason: str | None
+        try:
+            if evaluation is None:
+                trial_evaluation = constraint.evaluate(value)
+                if inspect.isawaitable(trial_evaluation):
+                    evaluation = cast("Awaitable[Any]", trial_evaluation)
+                else:
+                    return self._coerce_constraint_evaluation(trial_evaluation)
+            trial_result = await evaluation
+        except RetryableLLMError:
+            raise
+        except Exception as e:
+            reason = f"Evaluation fails for ID {self.meta_data.data_id} due to {e}."
+            tqdm.write(reason)
+            return False, reason
+        return self._coerce_constraint_evaluation(trial_result)
+
+    def _finalize_constraint_evaluation(
+        self,
+        constraint: Constraint,
+        evaluation: Any,
+    ) -> ConstraintEvaluation:
         passed, reason = self._coerce_constraint_evaluation(evaluation)
         passed_bool = bool(passed)
         normalized_reason = None if reason is None else str(reason)

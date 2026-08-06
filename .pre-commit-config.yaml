@@ -14,6 +14,7 @@ repos:
     args: [--allow-multiple-documents]
   - id: check-toml
   - id: check-json
+    exclude: ^data/generated_dataset/(dataset_info|state)\.json$
   - id: check-added-large-files
     exclude: uv.lock
   - id: check-merge-conflict

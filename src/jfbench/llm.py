@@ -1,12 +1,17 @@
 import asyncio
 import logging
 import os
+import random
 from typing import Any
 from typing import cast
 from typing import Literal
 from typing import TYPE_CHECKING
 
+from openai import APIConnectionError
+from openai import APITimeoutError
 from openai import AsyncOpenAI
+from openai import InternalServerError
+from openai import RateLimitError
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion import Choice as ChatChoice
 from openai.types.completion import Completion as LegacyCompletion
@@ -17,11 +22,30 @@ from tqdm import tqdm
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-N_PARALLEL_REQUEST = 200
-N_RETRIES_PER_REQUEST = 3
+DEFAULT_MAX_CONCURRENCY = 200
 DEFAULT_OPENROUTER_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BASE_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
+
+
+class RetryableLLMError(RuntimeError):
+    pass
+
+
+def _is_retryable_error(error: Exception) -> bool:
+    return isinstance(
+        error,
+        (
+            APIConnectionError,
+            APITimeoutError,
+            InternalServerError,
+            RateLimitError,
+            TimeoutError,
+            asyncio.TimeoutError,
+        ),
+    )
 
 
 class LLMClient:
@@ -30,6 +54,10 @@ class LLMClient:
         provider: Literal["openrouter", "vllm"] = "openrouter",
         model: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        *,
+        max_concurrency: int | None = None,
+        max_retries: int | None = None,
+        retry_base_seconds: float | None = None,
     ) -> None:
         body_params = dict(extra_body) if extra_body is not None else {}
         self.client: AsyncOpenAI
@@ -37,6 +65,24 @@ class LLMClient:
         self.base_url: str | None = None
         self.api_key: str | None = None
         self.timeout: int | None = None
+        configured_max_concurrency = body_params.pop("max_concurrency", max_concurrency)
+        configured_max_retries = body_params.pop("max_retries", max_retries)
+        configured_retry_base_seconds = body_params.pop("retry_base_seconds", retry_base_seconds)
+        self.max_concurrency = (
+            DEFAULT_MAX_CONCURRENCY
+            if configured_max_concurrency is None
+            else max(1, int(configured_max_concurrency))
+        )
+        self.max_retries = (
+            DEFAULT_MAX_RETRIES
+            if configured_max_retries is None
+            else max(1, int(configured_max_retries))
+        )
+        self.retry_base_seconds = (
+            DEFAULT_RETRY_BASE_SECONDS
+            if configured_retry_base_seconds is None
+            else max(0.0, float(configured_retry_base_seconds))
+        )
         model_name: str | None
         if model is not None:
             model_name = model
@@ -51,7 +97,7 @@ class LLMClient:
                 base_url="https://openrouter.ai/api/v1",
                 api_key=os.environ["OPENROUTER_API_KEY"],
             )
-            self.semaphore = asyncio.Semaphore(N_PARALLEL_REQUEST)
+            self.semaphore = asyncio.Semaphore(self.max_concurrency)
         elif provider == "vllm":
             base_url = body_params.pop("base_url", "http://localhost:8000/v1")
             api_key = body_params.pop("api_key", "unsed")
@@ -64,7 +110,7 @@ class LLMClient:
                 api_key=api_key,
                 timeout=timeout,
             )
-            self.semaphore = asyncio.Semaphore(N_PARALLEL_REQUEST)
+            self.semaphore = asyncio.Semaphore(self.max_concurrency)
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
         self.provider = provider
@@ -78,6 +124,9 @@ class LLMClient:
         serialized_extra_body = dict(self.extra_body)
         serialized_extra_body["temperature"] = self.temperature
         serialized_extra_body["max_tokens"] = self.max_tokens
+        serialized_extra_body["max_concurrency"] = self.max_concurrency
+        serialized_extra_body["max_retries"] = self.max_retries
+        serialized_extra_body["retry_base_seconds"] = self.retry_base_seconds
         if self.stop_token_ids is not None:
             serialized_extra_body["stop_token_ids"] = self.stop_token_ids
         if self.provider == "vllm":
@@ -139,7 +188,7 @@ class LLMClient:
 
         async def _get_answer(index: int, prompt: str) -> tuple[int, str, Any]:
             messages = [{"role": "user", "content": prompt}]
-            for i in range(N_RETRIES_PER_REQUEST):
+            for attempt in range(self.max_retries):
                 try:
                     async with semaphore:
                         response = await self.client.chat.completions.create(
@@ -152,13 +201,25 @@ class LLMClient:
                         )
                     return index, to_string(response)[0].strip(), response
                 except Exception as e:
+                    if not _is_retryable_error(e):
+                        logger.warning(
+                            f"Non-retryable error querying {self.provider} for prompt {index}: {e}"
+                        )
+                        raise
                     logger.warning(
-                        f"Error querying {self.provider} for prompt {index} (attempt {i + 1}): {e}"
+                        f"Retryable error querying {self.provider} for prompt {index} "
+                        f"(attempt {attempt + 1}/{self.max_retries}): {e}"
                     )
-                    if i == N_RETRIES_PER_REQUEST - 1:
-                        raise e
+                    if attempt == self.max_retries - 1:
+                        raise RetryableLLMError(
+                            f"Failed to obtain response for prompt {index} after "
+                            f"{self.max_retries} retries."
+                        ) from e
+                    if self.retry_base_seconds > 0:
+                        backoff = self.retry_base_seconds * (2**attempt)
+                        await asyncio.sleep(backoff + random.uniform(0.0, backoff * 0.25))
             raise RuntimeError(
-                f"Failed to obtain response for prompt {index} after {N_RETRIES_PER_REQUEST} retries."
+                f"Failed to obtain response for prompt {index} after {self.max_retries} retries."
             )
 
         tasks = [_get_answer(index, prompt) for index, prompt in enumerate(prompts)]

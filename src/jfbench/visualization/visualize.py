@@ -18,8 +18,11 @@ from jfbench.visualization.overview import generate_overview_charts
 
 
 DEFAULT_INPUT_DIR = Path("data/benchmark_results")
-PromptSource = Literal["ifbench"]
-PROMPT_SOURCE_CHOICES: tuple[PromptSource, ...] = ("ifbench",)
+PromptSource = Literal["ifbench", "ja_stackoverflow"]
+PROMPT_SOURCE_CHOICES: tuple[PromptSource, ...] = (
+    "ifbench",
+    "ja_stackoverflow",
+)
 ModelLabelMap = dict[str, dict[str, str]]
 ModelShortLabelMap = dict[str, str]
 
@@ -61,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Filter visualizations to specific prompt sources "
-            "(ifbench). "
+            "(ifbench, ja_stackoverflow). "
             "Can be provided multiple times or as a comma-separated string."
         ),
     )

@@ -12,16 +12,7 @@ from typing import cast
 from typing import Iterable
 from typing import Literal
 from typing import Sequence
-from typing import TYPE_CHECKING
 from typing import TypeVar
-
-
-if TYPE_CHECKING:
-    import torch
-else:
-    from jfbench.imports import LazyImport
-
-    torch = LazyImport("torch")
 
 import datasets
 import pandas as pd
@@ -36,11 +27,24 @@ from jfbench.benchmark.build import MetaData
 from jfbench.constraints._group import ConstraintGroupMixin
 from jfbench.llm import extract_reasoning_content
 from jfbench.llm import LLMClient
+from jfbench.llm import RetryableLLMError
 from jfbench.protocol import Constraint
 
 
 MAX_CONCURRENT_EVALUATIONS = 200
 DEFAULT_OUTPUT_DIR = Path("data/benchmark_results")
+DEFAULT_JUDGE_MAX_CONCURRENCY = 32
+DEFAULT_JUDGE_MAX_RETRIES = 5
+DEFAULT_JUDGE_RETRY_BASE_SECONDS = 1.0
+RESULT_RECORD_COLUMNS = (
+    "prompt_index",
+    "response",
+    "reasoning_content",
+    "results",
+    "prompt_source",
+    "n_constraints",
+    "prompt",
+)
 T = TypeVar("T")
 
 
@@ -140,12 +144,15 @@ def _build_dataset(
     constraint_set: ConstraintSetName,
     judge_config: ModelConfig | None = None,
     ifbench_dataset_path: str | None = None,
+    judge_max_concurrency: int = DEFAULT_JUDGE_MAX_CONCURRENCY,
+    judge_max_retries: int = DEFAULT_JUDGE_MAX_RETRIES,
+    judge_retry_base_seconds: float = DEFAULT_JUDGE_RETRY_BASE_SECONDS,
 ) -> list[BenchmarkData]:
-    active_judge_config = judge_config or DEFAULT_JUDGE_MODEL_SPEC
-    judge_client = LLMClient(
-        provider=active_judge_config.provider,
-        model=active_judge_config.model,
-        extra_body=active_judge_config.extra_body,
+    judge_client = _build_judge_client(
+        judge_config,
+        judge_max_concurrency=judge_max_concurrency,
+        judge_max_retries=judge_max_retries,
+        judge_retry_base_seconds=judge_retry_base_seconds,
     )
     if benchmark == "ifbench":
         if n_constraints == 1:
@@ -197,68 +204,81 @@ def _constraint_from_saved_entry(saved_entry: Any) -> Constraint:
     raise ValueError(f"Constraint entry must be dict or JSON string, got: {type(saved_entry)}")
 
 
-def _replace_llm_client_references(
-    value: Any,
-    replacement: LLMClient,
-    seen: set[int],
-) -> Any:
+def _build_judge_client(
+    judge_config: ModelConfig | None,
+    *,
+    judge_max_concurrency: int,
+    judge_max_retries: int,
+    judge_retry_base_seconds: float,
+) -> LLMClient:
+    active_judge_config = judge_config or DEFAULT_JUDGE_MODEL_SPEC
+    return LLMClient(
+        provider=active_judge_config.provider,
+        model=active_judge_config.model,
+        extra_body=active_judge_config.extra_body,
+        max_concurrency=judge_max_concurrency,
+        max_retries=judge_max_retries,
+        retry_base_seconds=judge_retry_base_seconds,
+    )
+
+
+def _replace_llm_clients(value: Any, judge_client: LLMClient, seen: set[int] | None = None) -> Any:
+    if seen is None:
+        seen = set()
+
     if isinstance(value, LLMClient):
-        return replacement
-    if isinstance(value, bool | int | float | str) or value is None:
-        return value
-    if isinstance(value, bytes):
-        return value
-    value_id = id(value)
-    if value_id in seen:
-        return value
-    seen.add(value_id)
-    if isinstance(value, list):
-        for idx, item in enumerate(value):
-            value[idx] = _replace_llm_client_references(item, replacement, seen)
-        return value
+        return judge_client
     if isinstance(value, tuple):
-        return tuple(_replace_llm_client_references(item, replacement, seen) for item in value)
-    if isinstance(value, set):
-        return {_replace_llm_client_references(item, replacement, seen) for item in value}
+        return tuple(_replace_llm_clients(item, judge_client, seen) for item in value)
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _replace_llm_clients(item, judge_client, seen)
+        return value
     if isinstance(value, dict):
-        for key in list(value.keys()):
-            value[key] = _replace_llm_client_references(value[key], replacement, seen)
+        for key, item in value.items():
+            value[key] = _replace_llm_clients(item, judge_client, seen)
         return value
-    if hasattr(value, "__dict__"):
-        for attr_name, attr_value in vars(value).items():
-            replaced = _replace_llm_client_references(attr_value, replacement, seen)
-            if replaced is not attr_value:
-                setattr(value, attr_name, replaced)
+    if not hasattr(value, "__dict__"):
         return value
+
+    object_id = id(value)
+    if object_id in seen:
+        return value
+    seen.add(object_id)
+    for name, item in vars(value).items():
+        setattr(value, name, _replace_llm_clients(item, judge_client, seen))
     return value
 
 
-def _apply_judge_config_override(
-    dataset: list[BenchmarkData],
-    judge_config: ModelConfig | None,
-) -> list[BenchmarkData]:
-    if judge_config is None:
-        return dataset
-    judge_client = LLMClient(
-        provider=judge_config.provider,
-        model=judge_config.model,
-        extra_body=judge_config.extra_body,
-    )
-    for benchmark_data in dataset:
-        updated_constraints: list[Constraint] = []
-        for constraint in benchmark_data.constraints:
-            replaced = _replace_llm_client_references(constraint, judge_client, seen=set())
-            updated_constraints.append(cast("Constraint", replaced))
-        benchmark_data.constraints = updated_constraints
-    return dataset
+def _contains_llm_client(value: Any, seen: set[int] | None = None) -> bool:
+    if seen is None:
+        seen = set()
+
+    if isinstance(value, LLMClient):
+        return True
+    if isinstance(value, tuple | list):
+        return any(_contains_llm_client(item, seen) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_llm_client(item, seen) for item in value.values())
+    if not hasattr(value, "__dict__"):
+        return False
+
+    object_id = id(value)
+    if object_id in seen:
+        return False
+    seen.add(object_id)
+    return any(_contains_llm_client(item, seen) for item in vars(value).values())
 
 
 def _load_dataset_from_path(
     dataset_path: str,
     constraint_set: ConstraintSetName,
     judge_config: ModelConfig | None = None,
+    judge_max_concurrency: int = DEFAULT_JUDGE_MAX_CONCURRENCY,
+    judge_max_retries: int = DEFAULT_JUDGE_MAX_RETRIES,
+    judge_retry_base_seconds: float = DEFAULT_JUDGE_RETRY_BASE_SECONDS,
 ) -> list[BenchmarkData]:
-    _ = judge_config
+    judge_client: LLMClient | None = None
     path = Path(dataset_path)
     rows: list[dict[str, Any]]
     if path.is_dir():
@@ -301,6 +321,15 @@ def _load_dataset_from_path(
                     f"Constraint name mismatch: constraint_types has {constraint_names[index]}, "
                     f"but constraints entry has {constraint.__class__.__name__}."
                 )
+            if _contains_llm_client(constraint):
+                if judge_client is None:
+                    judge_client = _build_judge_client(
+                        judge_config,
+                        judge_max_concurrency=judge_max_concurrency,
+                        judge_max_retries=judge_max_retries,
+                        judge_retry_base_seconds=judge_retry_base_seconds,
+                    )
+                constraint = _replace_llm_clients(constraint, judge_client)
             constraints.append(constraint)
         row_constraint_set_raw = row.get("constraint_set")
         if row_constraint_set_raw in {"train", "test"}:
@@ -332,7 +361,7 @@ def _load_dataset_from_path(
                 meta_data=meta_data,
             )
         )
-    return _apply_judge_config_override(dataset, judge_config)
+    return dataset
 
 
 def _load_rows_from_jsonl_zst(path: Path) -> list[dict[str, Any]]:
@@ -473,6 +502,46 @@ def _filter_results_by_dataset(
     ]
 
 
+def _filter_results_by_model(frame: pd.DataFrame, config: ModelConfig) -> pd.DataFrame:
+    if frame.empty or "model_short" not in frame.columns:
+        return frame
+    return frame.loc[frame["model_short"] == config.model_short]
+
+
+def _normalize_optional_value(value: Any) -> Any | None:
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def _build_result_entry(
+    *,
+    index: int,
+    benchmark_data: BenchmarkData,
+    response: str,
+    response_details: Any | None,
+    results: dict[str, bool] | None,
+    provider: str,
+    reasoning_content: str | None = None,
+) -> dict[str, Any]:
+    extracted_reasoning_content = extract_reasoning_content(provider, response_details)
+    if not extracted_reasoning_content and reasoning_content is not None:
+        extracted_reasoning_content = reasoning_content
+    full_entry = {
+        "prompt_index": index,
+        "response": response,
+        "reasoning_content": extracted_reasoning_content,
+        "results": results,
+        **benchmark_data.meta_data.__dict__,
+    }
+    if "prompt" not in full_entry:
+        full_entry["prompt"] = benchmark_data.text()
+    return {column: full_entry[column] for column in RESULT_RECORD_COLUMNS}
+
+
 def _shuffle_and_slice_dataset(
     dataset: Iterable[T],
     limit: int | None,
@@ -496,8 +565,7 @@ def _collect_pending_generation(
     existing_results = _load_results(results_path)
     completed_indices: set[int] = set()
     if not existing_results.empty:
-        mask = existing_results["model_short"] == config.model_short
-        model_results = existing_results.loc[mask]
+        model_results = _filter_results_by_model(existing_results, config)
         model_results = _filter_results_by_dataset(
             model_results,
             prompt_sources,
@@ -526,15 +594,14 @@ def _collect_pending_evaluations(
     dataset_list: list[BenchmarkData],
     override: bool,
     results_path: Path,
-) -> list[tuple[int, BenchmarkData, str, Any | None]]:
+) -> list[tuple[int, BenchmarkData, str, Any | None, str | None]]:
     if not dataset_list:
         return []
     prompt_sources, n_constraints_values = _dataset_filter_values(dataset_list)
     existing_results = _load_results(results_path)
     if existing_results.empty:
         return []
-    mask = existing_results["model_short"] == config.model_short
-    model_results = existing_results.loc[mask]
+    model_results = _filter_results_by_model(existing_results, config)
     model_results = _filter_results_by_dataset(
         model_results,
         prompt_sources,
@@ -546,53 +613,54 @@ def _collect_pending_evaluations(
         pending_eval = model_results
     else:
         pending_eval = model_results.loc[model_results["results"].isna()]
-    evaluation_items: list[tuple[int, BenchmarkData, str, Any | None]] = []
+    evaluation_items: list[tuple[int, BenchmarkData, str, Any | None, str | None]] = []
     for row in pending_eval.itertuples():
         if pd.isna(row.response):
             continue
         index = int(row.prompt_index)
         if 0 <= index < len(dataset_list):
-            response_details = getattr(row, "response_details", None)
-            try:
-                if pd.isna(response_details):
-                    response_details = None
-            except Exception:
-                pass
-            evaluation_items.append((index, dataset_list[index], row.response, response_details))
+            response_details = _normalize_optional_value(getattr(row, "response_details", None))
+            reasoning_content = _normalize_optional_value(getattr(row, "reasoning_content", None))
+            evaluation_items.append(
+                (index, dataset_list[index], row.response, response_details, reasoning_content)
+            )
     return evaluation_items
 
 
 async def _evaluate_entries(
     config: ModelConfig,
-    evaluation_items: list[tuple[int, BenchmarkData, str, Any | None]],
+    evaluation_items: list[tuple[int, BenchmarkData, str, Any | None, str | None]],
 ) -> list[dict[str, Any]]:
     async def _evaluate_entry(
         index: int,
         benchmark_data: BenchmarkData,
         response: str,
         response_details: Any | None,
-    ) -> dict[str, Any]:
-        evaluation = benchmark_data.evaluate(response)
-        if inspect.isawaitable(evaluation):
-            awaitable = cast("Awaitable[dict[str, bool]]", evaluation)
-            evaluation_dict = await awaitable
-        else:
-            evaluation_dict = cast("dict[str, bool]", evaluation)
-        reasoning_content = extract_reasoning_content(config.provider, response_details)
-        return {
-            "model": config.model,
-            "model_short": config.model_short,
-            "prompt_index": index,
-            "response": response,
-            "response_details": response_details,
-            "reasoning_content": reasoning_content,
-            "results": evaluation_dict,
-            **benchmark_data.meta_data.__dict__,
-        }
+        previous_reasoning_content: str | None,
+    ) -> dict[str, Any] | None:
+        try:
+            evaluation = benchmark_data.evaluate(response)
+            if inspect.isawaitable(evaluation):
+                awaitable = cast("Awaitable[dict[str, bool]]", evaluation)
+                evaluation_dict = await awaitable
+            else:
+                evaluation_dict = cast("dict[str, bool]", evaluation)
+        except RetryableLLMError as exc:
+            tqdm.write(f"Retryable judge error for prompt {index}: {exc}")
+            return None
+        return _build_result_entry(
+            index=index,
+            benchmark_data=benchmark_data,
+            response=response,
+            response_details=response_details,
+            results=evaluation_dict,
+            provider=config.provider,
+            reasoning_content=previous_reasoning_content,
+        )
 
     tasks = [
-        _evaluate_entry(index, benchmark_data, response, response_details)
-        for index, benchmark_data, response, response_details in evaluation_items
+        _evaluate_entry(index, benchmark_data, response, response_details, reasoning_content)
+        for index, benchmark_data, response, response_details, reasoning_content in evaluation_items
     ]
     entries: list[dict[str, Any]] = []
     if tasks:
@@ -604,7 +672,9 @@ async def _evaluate_entries(
         )
         try:
             for coro in progress:
-                entries.append(await coro)
+                entry = await coro
+                if entry is not None:
+                    entries.append(entry)
         finally:
             progress.close()
         entries.sort(key=lambda entry: entry["prompt_index"])
@@ -641,16 +711,14 @@ async def _generate_responses(
         raise RuntimeError("Number of response details does not match number of pending prompts.")
 
     return [
-        {
-            "model": config.model,
-            "model_short": config.model_short,
-            "prompt_index": index,
-            "response": response,
-            "response_details": detail,
-            "reasoning_content": extract_reasoning_content(config.provider, detail),
-            "results": None,
-            **benchmark_data.meta_data.__dict__,
-        }
+        _build_result_entry(
+            index=index,
+            benchmark_data=benchmark_data,
+            response=response,
+            response_details=detail,
+            results=None,
+            provider=config.provider,
+        )
         for (index, benchmark_data), response, detail in zip(
             pending_items, responses, response_details, strict=True
         )
@@ -667,13 +735,15 @@ def _upsert_entries(results_path: Path, entries: list[dict[str, Any]]) -> None:
         merged = new_df
     else:
         merged = pd.concat([existing, new_df], ignore_index=True)
-    required_columns = {"model_short", "prompt_index", "prompt_source", "n_constraints"}
+    required_columns = {"prompt_index", "prompt_source", "n_constraints"}
     if required_columns <= set(merged.columns):
         merged["prompt_index"] = merged["prompt_index"].astype(int)
-        subset = ["model_short", "prompt_index", "prompt_source", "n_constraints"]
+        subset = ["prompt_index", "prompt_source", "n_constraints"]
         sort_by = list(subset)
         merged = merged.drop_duplicates(subset=subset, keep="last")
         merged = merged.sort_values(by=sort_by).reset_index(drop=True)
+    saved_columns = [column for column in RESULT_RECORD_COLUMNS if column in merged.columns]
+    merged = merged.loc[:, saved_columns]
     json_lines = merged.to_json(orient="records", force_ascii=False, lines=True, index=False)
     if json_lines:
         results_path.write_text(json_lines, encoding="utf-8")
@@ -728,7 +798,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--benchmark",
         type=str,
         default="ifbench",
-        help="Benchmark dataset to use. Only ifbench is supported.",
+        help="Benchmark dataset to use. Provide comma-separated values to run multiple benchmarks.",
     )
     parser.add_argument(
         "--ifbench-dataset-path",
@@ -815,6 +885,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="JSON string describing the model to use for judge_client.",
     )
     parser.add_argument(
+        "--judge-max-concurrency",
+        type=int,
+        default=DEFAULT_JUDGE_MAX_CONCURRENCY,
+        help="Maximum number of concurrent judge requests.",
+    )
+    parser.add_argument(
+        "--judge-max-retries",
+        type=int,
+        default=DEFAULT_JUDGE_MAX_RETRIES,
+        help="Maximum number of retries per judge request.",
+    )
+    parser.add_argument(
+        "--judge-retry-base-seconds",
+        type=float,
+        default=DEFAULT_JUDGE_RETRY_BASE_SECONDS,
+        help="Base seconds for exponential backoff between judge retries.",
+    )
+    parser.add_argument(
         "--n-concurrent-generations",
         type=int,
         default=-1,
@@ -840,6 +928,9 @@ async def main(
     constraint_set: ConstraintSetName = "train",
     ifbench_dataset_path: str | None = None,
     dataset_path: str | Sequence[str] | None = None,
+    judge_max_concurrency: int = DEFAULT_JUDGE_MAX_CONCURRENCY,
+    judge_max_retries: int = DEFAULT_JUDGE_MAX_RETRIES,
+    judge_retry_base_seconds: float = DEFAULT_JUDGE_RETRY_BASE_SECONDS,
     n_concurrent_generations: int = -1,
 ) -> None:
     if model_specs_json is not None:
@@ -878,6 +969,9 @@ async def main(
                 constraint_set=constraint_set,
                 judge_config=judge_config,
                 ifbench_dataset_path=ifbench_dataset_path,
+                judge_max_concurrency=judge_max_concurrency,
+                judge_max_retries=judge_max_retries,
+                judge_retry_base_seconds=judge_retry_base_seconds,
             )
             return (benchmark_name, n_constraints_value), dataset
 
@@ -896,6 +990,9 @@ async def main(
                     dataset_path=path,
                     constraint_set=constraint_set,
                     judge_config=judge_config,
+                    judge_max_concurrency=judge_max_concurrency,
+                    judge_max_retries=judge_max_retries,
+                    judge_retry_base_seconds=judge_retry_base_seconds,
                 )
             )
         datasets = {
@@ -951,20 +1048,6 @@ async def main(
         )
 
 
-def _empty_torch_cuda_cache() -> None:
-    if torch is None:
-        return
-    cuda = getattr(torch, "cuda", None)
-    if cuda is None:
-        return
-    is_available = getattr(cuda, "is_available", None)
-    if callable(is_available) and not is_available():
-        return
-    empty_cache = getattr(cuda, "empty_cache", None)
-    if callable(empty_cache):
-        empty_cache()
-
-
 if __name__ == "__main__":
     args = parse_args()
     asyncio.run(
@@ -982,6 +1065,9 @@ if __name__ == "__main__":
             constraint_set=args.constraint_set,
             ifbench_dataset_path=args.ifbench_dataset_path,
             dataset_path=args.dataset_path,
+            judge_max_concurrency=args.judge_max_concurrency,
+            judge_max_retries=args.judge_max_retries,
+            judge_retry_base_seconds=args.judge_retry_base_seconds,
             n_concurrent_generations=args.n_concurrent_generations,
         )
     )

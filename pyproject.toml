@@ -5,7 +5,7 @@ requires = [ "setuptools>=61.1", "wheel" ]
 
 [project]
 name = "jfbench"
-version = "0.2.1"
+version = "0.3.0"
 
 description = "Japanese instruction Following Benchmark"
 readme = "README.md"
@@ -63,7 +63,12 @@ optional-dependencies = { gpu = [  ] }
 package-dir = { "" = "src" }
 
 [tool.setuptools.package-data]
-jfbench = [ "data/ifbench_ja_translated.jsonl" ]
+jfbench = [
+  "data/*.jsonl",
+  "data/*.zst",
+  "data/LICENSE-*",
+  "data/README.md",
+]
 
 [tool.setuptools.packages.find]
 where = [ "src" ]
@@ -120,13 +125,6 @@ mypy_path = [
   "src",
   "tests",
 ]
-
-[[tool.mypy.overrides]]
-module = [
-  "jfbench.ifbench_translation",
-  "jfbench.ifbench_translation.*",
-]
-ignore_errors = true
 
 [tool.uv]
 package = true
