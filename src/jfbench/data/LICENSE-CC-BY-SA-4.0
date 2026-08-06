@@ -1,0 +1,9 @@
+`ja_stackoverflow_train.jsonl.zst` contains content from Japanese Stack Overflow
+(https://ja.stackoverflow.com/), contributed by Stack Exchange users and licensed under the
+Creative Commons Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0).
+
+For the full license text, see https://creativecommons.org/licenses/by-sa/4.0/
+
+Attribution: content is authored by Japanese Stack Overflow contributors and obtained from the
+Stack Exchange Data Dump. Any redistribution of this file, or of adaptations derived from it,
+must retain this attribution and be licensed under CC BY-SA 4.0.

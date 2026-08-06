@@ -20,6 +20,11 @@ def test_html_table_constraint_valid() -> None:
     assert HtmlTableFormatConstraint().evaluate(html)[0] is True
 
 
+def test_html_table_constraint_rejects_invalid_marked_section() -> None:
+    html = "<table><tr><td><![（])[^（）]*|(?=[）])</td></tr></table>"
+    assert HtmlTableFormatConstraint().evaluate(html)[0] is False
+
+
 def test_html_table_constraint_requires_single_table() -> None:
     html = "<div>wrap</div><table><tr><td>a</td></tr></table>"
     constraint = HtmlTableFormatConstraint()

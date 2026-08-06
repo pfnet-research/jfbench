@@ -64,8 +64,14 @@ class MarkdownTableFormatConstraint(ConstraintGroupMixin):
 class HtmlTableFormatConstraint(ConstraintGroupMixin):
     def evaluate(self, value: str) -> ConstraintEvaluation:
         _table_fragment_re = re.compile(r"^\s*<table\b[^>]*>.*</table>\s*$", re.I | re.S)
+        _invalid_non_cdata_marked_section_re = re.compile(r"<!\[(?!CDATA\[)", re.I)
         if not _table_fragment_re.match(value):
             reason = "[HTML Table] Not a standalone <table> fragment."
+            logger.info(reason)
+            return False, reason
+
+        if _invalid_non_cdata_marked_section_re.search(value):
+            reason = "[HTML Table] Invalid marked section."
             logger.info(reason)
             return False, reason
 

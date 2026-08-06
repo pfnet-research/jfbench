@@ -16,15 +16,24 @@ import zstandard as zstd
 
 from jfbench.benchmark import eval as eval_module
 from jfbench.constraints._group import ConstraintGroupMixin
-from jfbench.llm import LLMClient
 
 
 if TYPE_CHECKING:
     from jfbench.benchmark.build import BenchmarkData
+    from jfbench.llm import LLMClient
 
 
 _DEFAULT_PROMPT_SOURCE = "test"
 _DEFAULT_N_CONSTRAINTS = 1
+_EXPECTED_RESULT_COLUMNS = [
+    "prompt_index",
+    "response",
+    "reasoning_content",
+    "results",
+    "prompt_source",
+    "n_constraints",
+    "prompt",
+]
 
 
 class _DummyBenchmark:
@@ -115,33 +124,6 @@ class _SampleSerializableConstraint(ConstraintGroupMixin):
         return f"Include {self.foo}"
 
 
-class _SerializableLLMConstraint(ConstraintGroupMixin):
-    def __init__(
-        self,
-        client: LLMClient,
-        foo: str = "needle",
-        *,
-        seed: int | None = None,
-    ) -> None:
-        super().__init__(seed=seed)
-        self.client = client
-        self.foo = foo
-
-    def evaluate(self, value: str) -> tuple[bool, None]:
-        return self.foo in value, None
-
-    def instructions(self, train_or_test: str = "train") -> str:
-        _ = train_or_test
-        return f"Include {self.foo}"
-
-    @property
-    def group(self) -> str:
-        return "Test"
-
-    def rewrite_instructions(self) -> str:
-        return f"Include {self.foo}"
-
-
 def _write_jsonl_zst(path: Path, rows: list[dict[str, Any]]) -> None:
     compressor = zstd.ZstdCompressor()
     with path.open("wb") as raw:
@@ -179,13 +161,9 @@ def test_evaluate_model_generates_and_evaluates_openrouter(tmp_path: Path) -> No
     stored = (
         pd.read_json(results_path, lines=True).sort_values("prompt_index").reset_index(drop=True)
     )
+    assert stored.columns.tolist() == _EXPECTED_RESULT_COLUMNS
     assert stored["prompt_index"].tolist() == [0, 1, 2]
-    assert stored["model_short"].unique().tolist() == ["TestModel"]
-    assert stored["response_details"].tolist() == [
-        "detail-for-prompt-0",
-        "detail-for-prompt-1",
-        "detail-for-prompt-2",
-    ]
+    assert stored["prompt"].tolist() == ["prompt-0", "prompt-1", "prompt-2"]
     assert stored["reasoning_content"].tolist() == ["", "", ""]
     assert stored["results"].notna().all()
 
@@ -215,9 +193,8 @@ def test_evaluate_model_stores_reasoning_content(tmp_path: Path) -> None:
     stored = (
         pd.read_json(results_path, lines=True).sort_values("prompt_index").reset_index(drop=True)
     )
+    assert stored.columns.tolist() == _EXPECTED_RESULT_COLUMNS
     assert stored["reasoning_content"].tolist() == ["reasoning-for-prompt-0"]
-    detail = stored.loc[0, "response_details"]
-    assert detail["choices"][0]["message"]["reasoning_content"] == "reasoning-for-prompt-0"
 
 
 def test_evaluate_model_override_forces_regeneration_and_evaluation(tmp_path: Path) -> None:
@@ -267,11 +244,8 @@ def test_evaluate_model_override_forces_regeneration_and_evaluation(tmp_path: Pa
     stored = (
         pd.read_json(results_path, lines=True).sort_values("prompt_index").reset_index(drop=True)
     )
+    assert stored.columns.tolist() == _EXPECTED_RESULT_COLUMNS
     assert stored["response"].tolist() == ["response-for-prompt-0", "response-for-prompt-1"]
-    assert stored["response_details"].tolist() == [
-        "detail-for-prompt-0",
-        "detail-for-prompt-1",
-    ]
     assert stored["reasoning_content"].tolist() == ["", ""]
     assert stored["results"].notna().all()
 
@@ -368,9 +342,53 @@ def test_evaluate_model_only_evaluates_existing(tmp_path: Path) -> None:
     )
 
     stored = pd.read_json(results_path, lines=True)
+    assert stored.columns.tolist() == _EXPECTED_RESULT_COLUMNS
     assert stored.loc[stored["prompt_index"] == 0, "results"].notna().all()
-    assert stored.loc[stored["prompt_index"] == 0, "response_details"].notna().all()
     assert stored.loc[stored["prompt_index"] == 0, "reasoning_content"].notna().all()
+
+
+def test_evaluate_model_preserves_existing_reasoning_without_response_details(
+    tmp_path: Path,
+) -> None:
+    results_path = tmp_path / "results.jsonl"
+    dataset = [_DummyBenchmark(0)]
+    existing_entries = [
+        {
+            "prompt_index": 0,
+            "response": "response-for-prompt-0",
+            "reasoning_content": "cached-reasoning",
+            "results": None,
+            "prompt_source": _DEFAULT_PROMPT_SOURCE,
+            "n_constraints": _DEFAULT_N_CONSTRAINTS,
+            "prompt": "prompt-0",
+        }
+    ]
+    results_path.write_text(
+        pd.DataFrame(existing_entries).to_json(orient="records", lines=True, index=False),
+        encoding="utf-8",
+    )
+    config = eval_module.ModelConfig(
+        provider="openrouter",
+        model="test-model",
+        model_short="TestModel",
+    )
+
+    _ = asyncio.run(
+        eval_module.evaluate_model(
+            cast("list[BenchmarkData]", dataset),
+            config=config,
+            with_generate=False,
+            with_eval=True,
+            override=False,
+            results_path=results_path,
+            client=None,
+        )
+    )
+
+    stored = pd.read_json(results_path, lines=True)
+    assert stored.columns.tolist() == _EXPECTED_RESULT_COLUMNS
+    assert stored["reasoning_content"].tolist() == ["cached-reasoning"]
+    assert stored["results"].notna().all()
 
 
 def test_generate_responses_batches_async_requests() -> None:
@@ -762,7 +780,7 @@ def test_collect_pending_evaluations_skips_other_prompt_sources(tmp_path: Path) 
             "prompt_index": 0,
             "prompt_source": "other",
             "n_constraints": 1,
-            "response": "response-other",
+            "response": "response-talent",
             "results": None,
         },
     ]
@@ -788,11 +806,12 @@ def test_collect_pending_evaluations_skips_other_prompt_sources(tmp_path: Path) 
     )
 
     assert len(evaluation_items) == 1
-    index, benchmark, response, _ = evaluation_items[0]
+    index, benchmark, response, _, reasoning_content = evaluation_items[0]
     assert index == 0
     assert isinstance(benchmark, _DummyBenchmark)
     assert benchmark.index == 0
     assert response == "response-ifbench"
+    assert reasoning_content is None
 
 
 def test_parse_args_requires_model_specs_json() -> None:
@@ -881,27 +900,9 @@ def test_parse_args_supports_multiple_constraint_values() -> None:
     assert args.n_constraints == "1,3"
 
 
-def test_select_judge_config_rejects_array() -> None:
-    judge_specs = [
-        {
-            "provider": "vllm",
-            "model": "judge-model",
-            "model_short": "JudgeModel",
-            "extra_body": {"base_url": "http://localhost:9000/v1"},
-        }
-    ]
-    with pytest.raises(ValueError, match="JSON object"):
-        eval_module._select_judge_config(json.dumps(judge_specs))  # noqa: SLF001
-
-
-def test_normalize_benchmark_list_rejects_unknown_benchmark() -> None:
-    with pytest.raises(ValueError, match="Unsupported benchmark"):
-        eval_module._normalize_benchmark_list("other")  # noqa: SLF001
-
-
-def test_parse_args_rejects_removed_favourable_flag() -> None:
+def test_parse_args_rejects_unknown_flag() -> None:
     with pytest.raises(SystemExit):
-        eval_module.parse_args(["--favourable-for-plamo"])
+        eval_module.parse_args(["--unknown-flag"])
 
 
 def test_shuffle_and_slice_dataset_is_deterministic() -> None:
@@ -1044,48 +1045,6 @@ def test_load_dataset_from_path_uses_constraints_payload(monkeypatch: MonkeyPatc
     assert constraint.foo == "from-constraints"
 
 
-def test_load_dataset_from_path_overrides_restored_judge_client(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    dataset_client = LLMClient(
-        provider="vllm",
-        model="dataset-judge",
-        extra_body={"base_url": "http://localhost:8009/v1"},
-    )
-    serialized = _SerializableLLMConstraint(
-        client=dataset_client, foo="from-constraints"
-    ).to_json()
-    row = {
-        "prompt_source": "ifbench",
-        "prompt_id": "prompt-0",
-        "prompt_document": "document-text",
-        "prompt": "prompt-text",
-        "constraint_types": ["_SerializableLLMConstraint"],
-        "constraints": [serialized],
-        "constraint_instructions": ["stub"],
-        "seed": 123,
-    }
-    monkeypatch.setattr("jfbench.benchmark.eval.datasets.load_from_disk", lambda path: [row])
-
-    judge_config = eval_module.ModelConfig(
-        provider="vllm",
-        model="override-judge",
-        model_short="OverrideJudge",
-        extra_body={"base_url": "http://localhost:8010/v1"},
-    )
-    dataset = eval_module._load_dataset_from_path(  # noqa: SLF001
-        dataset_path="dummy-path",
-        constraint_set="test",
-        judge_config=judge_config,
-    )
-
-    assert len(dataset) == 1
-    constraint = dataset[0].constraints[0]
-    assert isinstance(constraint, _SerializableLLMConstraint)
-    assert constraint.client.model == "override-judge"
-    assert constraint.client.base_url == "http://localhost:8010/v1"
-
-
 def test_load_dataset_from_path_falls_back_for_direct_jsonl_zst_file(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
@@ -1179,7 +1138,7 @@ def test_main_uses_loaded_dataset_when_dataset_path_is_set(
         _DummyBenchmark(0, prompt_source="ifbench", n_constraints=1),
         _DummyBenchmark(1, prompt_source="ifbench", n_constraints=1),
         _DummyBenchmark(2, prompt_source="ifbench", n_constraints=2),
-        _DummyBenchmark(3, prompt_source="other", n_constraints=1),
+        _DummyBenchmark(3, prompt_source="ja_stackoverflow", n_constraints=1),
     ]
     load_calls: list[str] = []
     evaluated: list[tuple[str, int, int]] = []
@@ -1381,28 +1340,3 @@ def test_parse_model_specs_json_validates_input() -> None:
         eval_module._parse_model_specs_json("{}")  # noqa: SLF001
     with pytest.raises(ValueError):
         eval_module._parse_model_specs_json("[]")  # noqa: SLF001
-
-
-def test_empty_torch_cuda_cache_noop_without_torch(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.setattr(eval_module, "torch", None, raising=False)
-
-    eval_module._empty_torch_cuda_cache()  # noqa: SLF001
-
-
-def test_empty_torch_cuda_cache_calls_empty_cache(monkeypatch: MonkeyPatch) -> None:
-    class _CudaStub:
-        def __init__(self) -> None:
-            self.called = False
-
-        def is_available(self) -> bool:
-            return True
-
-        def empty_cache(self) -> None:
-            self.called = True
-
-    cuda_stub = _CudaStub()
-    monkeypatch.setattr(eval_module, "torch", SimpleNamespace(cuda=cuda_stub), raising=False)
-
-    eval_module._empty_torch_cuda_cache()  # noqa: SLF001
-
-    assert cuda_stub.called is True

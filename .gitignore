@@ -135,5 +135,5 @@ data/jfbench*
 data/jftrain*
 data/sft*
 data/generated*
-data/strict*
 !ifbench*
+!ja_stackoverflow*

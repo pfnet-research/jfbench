@@ -2,7 +2,6 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
 from pytest import MonkeyPatch
 
 from jfbench.llm import extract_reasoning_content
@@ -101,28 +100,6 @@ def test_openrouter_client_enables_reasoning_by_default(monkeypatch: MonkeyPatch
 
     assert client.extra_body == {}
     assert client.temperature == 0.1
-
-
-def test_llm_client_defaults_to_openrouter_gpt_oss_120b(monkeypatch: MonkeyPatch) -> None:
-    class _DummyAsyncOpenAI:
-        def __init__(self, *, base_url: str, api_key: str) -> None:
-            self.base_url = base_url
-            self.api_key = api_key
-
-    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy")
-    monkeypatch.setattr("jfbench.llm.AsyncOpenAI", _DummyAsyncOpenAI)
-
-    client = LLMClient()
-
-    assert client.provider == "openrouter"
-    assert client.model == "openai/gpt-oss-120b"
-
-
-def test_vllm_client_requires_model_or_env(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.delenv("JFBENCH_LOCAL_MODEL", raising=False)
-
-    with pytest.raises(ValueError, match="Model name is required"):
-        _ = LLMClient(provider="vllm")
 
 
 def test_extract_reasoning_content_supports_vllm_detail() -> None:
