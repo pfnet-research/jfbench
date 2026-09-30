@@ -1,8 +1,8 @@
 from collections import Counter
-from functools import lru_cache
 from itertools import pairwise
 import logging
 import re
+import threading
 import unicodedata
 
 from janome.tokenizer import Tokenizer
@@ -16,10 +16,15 @@ from jfbench.protocol import ConstraintEvaluation
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=1)
+_tokenizer_local = threading.local()
+
+
 def _load_tokenizer() -> Tokenizer:
-    """Load a shared Janome tokenizer instance."""
-    return Tokenizer()
+    """Load a per-thread Janome tokenizer instance (Tokenizer is not thread-safe)."""
+    tokenizer = getattr(_tokenizer_local, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = _tokenizer_local.tokenizer = Tokenizer()
+    return tokenizer
 
 
 class NoConsecutiveWordsIfbenchConstraint(ConstraintGroupMixin):

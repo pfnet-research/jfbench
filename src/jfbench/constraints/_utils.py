@@ -1,5 +1,6 @@
 from functools import lru_cache
 import re
+import threading
 
 from janome.tokenizer import Tokenizer
 import pysbd
@@ -13,9 +14,15 @@ def _load_segmenter() -> pysbd.Segmenter:
     return pysbd.Segmenter(language="ja", clean=False)
 
 
-@lru_cache(maxsize=1)
+_tokenizer_local = threading.local()
+
+
 def _load_tokenizer() -> Tokenizer:
-    return Tokenizer()
+    """Load a per-thread Janome tokenizer instance (Tokenizer is not thread-safe)."""
+    tokenizer = getattr(_tokenizer_local, "tokenizer", None)
+    if tokenizer is None:
+        tokenizer = _tokenizer_local.tokenizer = Tokenizer()
+    return tokenizer
 
 
 def split_sentences(text: str) -> list[str]:
