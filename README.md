@@ -4,6 +4,35 @@
 
 JFBench is a benchmark suite for evaluating Japanese LLM instruction-following performance. It provides scripts for generation, evaluation, summary, and visualization, as well as scripts for building SFT / DPO / GRPO training datasets from the same constraint library.
 
+## Results
+
+Pass rates (%) on [pfnet/jfbench-verified](https://huggingface.co/datasets/pfnet/jfbench-verified). Columns are the number of constraints per prompt (200 prompts each), and a response passes only when it satisfies all of its constraints. Avg. is the mean over the four columns. The judge is `google/gemma-4-31b-it` (bf16) and the generation limit is 16,384 tokens including reasoning.
+
+### Reasoning
+
+| Model | 1 | 2 | 4 | 8 | Avg. |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PLaMo 3.0 Prime | 89.0 | 77.5 | 50.5 | 25.5 | 60.6 |
+| PLaMo 3.1 Prime | 84.0 | 72.0 | 43.0 | 21.5 | 55.1 |
+| gpt-oss-120b | 66.0 | 50.0 | 32.0 | 10.5 | 39.6 |
+| Gemma 4 31B IT | 80.0 | 56.5 | 40.0 | 17.5 | 48.5 |
+| Qwen3.6 27B | 79.0 | 64.5 | 36.5 | 12.5 | 48.1 |
+| Qwen3.8 27B | 74.0 | 51.5 | 33.5 | 15.0 | 43.5 |
+| Muse Glimmer 30B | 77.0 | 63.5 | 36.5 | 18.5 | 48.9 |
+| ELYZA-Thinking 33B | 79.5 | 65.5 | 44.5 | 17.5 | 51.8 |
+| llm-jp-4.1 33B Thinking | 74.0 | 51.0 | 27.0 | 7.0 | 39.8 |
+
+### Non-Reasoning
+
+| Model | 1 | 2 | 4 | 8 | Avg. |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PLaMo 3.0 Prime | 77.5 | 65.5 | 28.5 | 14.5 | 46.5 |
+| PLaMo 3.1 Prime | 78.0 | 65.5 | 33.5 | 7.5 | 46.1 |
+| Gemma 3 27B IT | 59.0 | 34.5 | 8.0 | 1.5 | 25.8 |
+| Gemma 4 31B IT | 70.5 | 46.5 | 25.0 | 12.5 | 38.6 |
+| Qwen3.6 27B | 64.5 | 36.5 | 18.5 | 4.0 | 30.9 |
+| Qwen3.8 27B | 69.5 | 45.0 | 14.5 | 6.0 | 33.8 |
+
 ## Setup
 
 Dependencies are managed with `uv`.
