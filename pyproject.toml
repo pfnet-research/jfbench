@@ -130,6 +130,7 @@ mypy_path = [
 package = true
 required-version = ">=0.6.11"
 constraint-dependencies = [
+  "certifi>=2026.10.19",
   "kaleido!=0.2.1.post1; sys_platform!='manylinux2014_armv7l'", # workaround for uv error
 ]
 no-build-package = [ "torch-cluster", "torch-scatter", "torch-sparse" ]
